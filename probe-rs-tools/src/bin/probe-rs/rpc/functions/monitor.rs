@@ -4,8 +4,9 @@ use crate::{
     rpc::{
         Key, ObjectStorageSlot,
         functions::{
-            MonitorEndpoint, MultiTopicPublisher, MultiTopicWriter, RpcResult, RpcSpawnContext,
-            RttTopic, SemihostingTopic, WireTxImpl, flash::BootInfo,
+            MonitorEndpoint, MultiTopicPublisher, MultiTopicWriter, NoResponse, RpcContext,
+            RpcResult, RpcSpawnContext, RttTopic, SemihostingTopic, WireTxImpl,
+            flash::BootInfo,
         },
         utils::{
             run_loop::{ReturnReason, RunLoop, RunLoopPoller, VectorCatchConfig},
@@ -69,6 +70,12 @@ pub struct MonitorRequest {
     pub options: MonitorOptions,
 }
 
+#[derive(Serialize, Deserialize, Schema)]
+pub struct StartRequest {
+    pub sessid: Key<Session>,
+    pub mode: MonitorMode,
+}
+
 /// Reasons why the firmware exited.
 #[derive(Serialize, Deserialize, Schema)]
 pub enum MonitorExitReason {
@@ -106,6 +113,22 @@ pub async fn monitor(
         .reply::<MonitorEndpoint>(header.seq_no, &resp)
         .await
         .unwrap();
+}
+
+pub async fn start_target(
+    ctx: &mut RpcContext,
+    _header: VarHeader,
+    request: StartRequest,
+) -> NoResponse {
+    let mut session = ctx.session(request.sessid).await;
+    request.mode.prepare(&mut session, 0)?;
+
+    let mut core = session.core(0)?;
+    if core.core_halted()? {
+        core.run()?;
+    }
+
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Clone, Schema)]
@@ -198,6 +221,8 @@ fn monitor_impl(
     let client_key = request.options.rtt_client;
     let core_id = client_key
         .map(|rtt_client| ctx.object_mut_blocking(rtt_client).core_id())
+        // Fall back to core 0 when there is no RTT client (e.g. plain Run without RTT).
+        // Multi-core support would require propagating core_id through MonitorMode / RunRequest.
         .unwrap_or(0);
 
     let mut run_loop = RunLoop {

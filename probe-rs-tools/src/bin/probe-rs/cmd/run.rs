@@ -263,7 +263,7 @@ impl Cmd {
             &self.path,
             self.format_options,
             self.download_options,
-            Some(&mut rtt_client),
+            rtt_client.as_mut(),
             None,
         )
         .await?;
@@ -292,7 +292,7 @@ impl Cmd {
                 },
                 &self.monitor_options,
                 &self.path,
-                Some(rtt_client),
+                rtt_client,
             )
             .await
         } else {
@@ -301,7 +301,7 @@ impl Cmd {
                 MonitorMode::Run(boot_info),
                 Some(&self.path),
                 &self.monitor_options,
-                Some(rtt_client),
+                rtt_client,
                 VectorCatchConfig {
                     catch_hardfault: !self.run_options.no_catch_hardfault,
                     catch_reset: !self.run_options.no_catch_reset,

@@ -19,7 +19,10 @@ use crate::{
             },
             info::{InfoEvent, TargetInfoRequest, TargetNameRequest, target_info, target_name},
             memory::{ReadMemoryRequest, WriteMemoryRequest, read_memory, write_memory},
-            monitor::{MonitorRequest, MonitorResponse, RttEvent, SemihostingEvent, monitor},
+            monitor::{
+                MonitorRequest, MonitorResponse, RttEvent, SemihostingEvent, StartRequest,
+                monitor, start_target,
+            },
             probe::{
                 AttachRequest, AttachResponse, ListProbesRequest, ListProbesResponse,
                 SelectProbeRequest, SelectProbeResponse, attach, list_probes, select_probe,
@@ -475,6 +478,7 @@ endpoints! {
     | EraseEndpoint             | EraseRequest            | NoResponse              | "flash/erase"      |
     | VerifyEndpoint            | VerifyRequest           | VerifyResponse          | "flash/verify"     |
     | MonitorEndpoint           | MonitorRequest          | MonitorResponse         | "monitor"          |
+    | StartTargetEndpoint       | StartRequest            | NoResponse              | "monitor/start"    |
 
     | ListTestsEndpoint         | ListTestsRequest        | ListTestsResponse       | "tests/list"       |
     | RunTestEndpoint           | RunTestRequest          | RunTestResponse         | "tests/run"        |
@@ -545,6 +549,7 @@ postcard_rpc::define_dispatch! {
         | EraseEndpoint             | async     | erase             |
         | VerifyEndpoint            | async     | verify            |
         | MonitorEndpoint           | spawn     | monitor           |
+        | StartTargetEndpoint       | async     | start_target      |
         | RttDownEndpoint           | async     | write_rtt_down    |
 
         | ListTestsEndpoint         | spawn     | list_tests        |

@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use probe_rs::architecture::arm::{component::TraceSink, swo::SwoConfig};
+use probe_rs::architecture::arm::{component::{TraceMemoryConfig, TraceSink}, swo::SwoConfig};
 use probe_rs::config::Registry;
 use probe_rs::probe::list::Lister;
 
@@ -74,7 +74,10 @@ impl Cmd {
 
         match self.source {
             ItmSource::TraceMemory { coreclk } => {
-                session.setup_tracing(self.shared.core, TraceSink::TraceMemory)?;
+                session.setup_tracing(
+                    self.shared.core,
+                    TraceSink::TraceMemory(TraceMemoryConfig::default()),
+                )?;
 
                 let trace = session.read_trace_data()?;
                 let decoder =

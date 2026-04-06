@@ -53,6 +53,10 @@ impl SemihostingOptions {
         Self { mappings: vec![] }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.mappings.is_empty()
+    }
+
     pub fn add_file(&mut self, from: String, to: String) -> Result<(), Infallible> {
         self.mappings.push(Mapping::Exact(from, to));
         Ok(())

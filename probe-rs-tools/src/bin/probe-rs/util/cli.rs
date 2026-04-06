@@ -326,7 +326,13 @@ pub async fn parse_metadata(path: &Path) -> anyhow::Result<(FileMetadata, Option
     }
 
     let defmt_data = if load_defmt_data {
-        DefmtState::try_from_bytes(&elf)?
+        match DefmtState::try_from_bytes(&elf) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::debug!(?error, "Skipping defmt metadata for ELF without usable .defmt data");
+                None
+            }
+        }
     } else {
         None
     };
@@ -345,11 +351,18 @@ pub async fn rtt_client(
     meta: &FileMetadata,
     monitor_options: &MonitoringOptions,
     timestamp_offset: Option<UtcOffset>,
-) -> anyhow::Result<CliRttClient> {
+) -> anyhow::Result<Option<CliRttClient>> {
+    let found_rtt_control_block = meta.scan_regions.is_some();
     let scan_regions = match &meta.scan_regions {
         Some(scan_regions) => scan_regions.clone(),
         None => monitor_options.scan_region.clone(),
     };
+
+    let rtt_requested =
+        !matches!(&monitor_options.scan_region, ScanRegion::Ranges(ranges) if ranges.is_empty());
+    if !found_rtt_control_block && !rtt_requested {
+        return Ok(None);
+    }
 
     // We don't really know what to configure here, so we set a default configuration if we can, but that's it.
     let rtt_client = session
@@ -364,7 +377,7 @@ pub async fn rtt_client(
         .await?;
 
     // The actual data processor objects will be created once we have the channel names.
-    Ok(CliRttClient {
+    Ok(Some(CliRttClient {
         handle: rtt_client.handle,
         timestamp_offset,
         show_timestamps: !monitor_options.no_timestamps,
@@ -372,7 +385,7 @@ pub async fn rtt_client(
         channel_processors: vec![],
         defmt_data: meta.defmt_data.clone(),
         log_format: monitor_options.log_format.clone(),
-    })
+    }))
 }
 
 pub async fn flash(
@@ -606,6 +619,22 @@ pub async fn monitor(
     let semihosting_options = parse_semihosting_options(&monitor_options.semihosting_file)?;
     let mut target_output_files =
         connect_target_output_files(&monitor_options.target_output_file).await?;
+
+    let explicit_rtt_monitoring = !matches!(
+        &monitor_options.scan_region,
+        ScanRegion::Ranges(ranges) if ranges.is_empty()
+    ) || monitor_options.list_rtt
+        || !monitor_options.rtt_up_channels.is_empty();
+
+    let quiet_run = !explicit_rtt_monitoring
+        && semihosting_options.is_empty()
+        && target_output_files.is_empty()
+        && !monitor_options.always_print_stacktrace;
+
+    if quiet_run {
+        session.start_target(mode).await?;
+        return Ok(());
+    }
 
     let options = MonitorOptions {
         catch_reset: vector_catch.catch_reset,

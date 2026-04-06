@@ -130,7 +130,7 @@ impl ArmDebugSequence for Nrf52 {
         sink: &TraceSink,
     ) -> Result<(), ArmError> {
         let tpiu_clock = match sink {
-            TraceSink::TraceMemory => {
+            TraceSink::TraceMemory(_) => {
                 tracing::error!("nRF52 does not have a trace buffer");
                 return Err(ArmError::from(ComponentError::NordicNoTraceMem));
             }

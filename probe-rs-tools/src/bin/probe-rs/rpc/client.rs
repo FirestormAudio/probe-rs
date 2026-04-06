@@ -49,7 +49,7 @@ use crate::{
             },
             info::{InfoEvent, TargetInfoRequest, TargetNameRequest},
             memory::{ReadMemoryRequest, WriteMemoryRequest},
-            monitor::{MonitorExitReason, MonitorMode, MonitorOptions, MonitorRequest},
+            monitor::{MonitorExitReason, MonitorMode, MonitorOptions, MonitorRequest, StartRequest},
             probe::{
                 AttachRequest, AttachResult, DebugProbeEntry, DebugProbeSelector,
                 ListProbesRequest, SelectProbeRequest, SelectProbeResult,
@@ -59,6 +59,7 @@ use crate::{
             rtt_client::{CreateRttClientRequest, RttClientData, RttDownRequest, ScanRegion},
             stack_trace::{StackTraces, TakeStackTraceRequest},
             test::{ListTestsRequest, RunTestRequest, Test, TestResult, Tests},
+            StartTargetEndpoint,
         },
         transport::memory::{PostcardReceiver, PostcardSender, WireRx, WireTx},
         utils::semihosting::SemihostingOptions,
@@ -567,6 +568,15 @@ impl SessionInterface {
                 },
                 on_msg,
             )
+            .await
+    }
+
+    pub async fn start_target(&self, mode: MonitorMode) -> anyhow::Result<()> {
+        self.client
+            .send_resp::<StartTargetEndpoint, _>(&StartRequest {
+                sessid: self.sessid,
+                mode,
+            })
             .await
     }
 

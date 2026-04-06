@@ -225,15 +225,21 @@ fn frame_pointer_stack_walk_memory_interface(
     //   link in the chain." - https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
     while frame_pointer != 0 {
         let adjusted_return_address;
-        AdjustedFrameRecord {
-            frame_pointer,
-            adjusted_return_address,
-        } = read_frame_record_for_core(
+        let Ok(record) = read_frame_record_for_core(
             memory,
             instruction_set,
             frame_pointer,
             last_program_counter,
-        )?;
+        ) else {
+            // Memory read failed (e.g. data abort on unmapped address) — the
+            // frame pointer chain has walked off into an invalid region.  Stop
+            // gracefully with whatever frames we have collected so far.
+            break;
+        };
+        AdjustedFrameRecord {
+            frame_pointer,
+            adjusted_return_address,
+        } = record;
 
         // Stack grows down, so frame pointer should be increasing when walking up callstack
         // Stop if the frame pointer has not increased

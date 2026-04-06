@@ -54,7 +54,7 @@ impl Cmd {
             MonitorMode::AttachToRunning,
             self.path.as_deref(),
             &self.monitor_options,
-            Some(rtt_client),
+            rtt_client,
             VectorCatchConfig {
                 catch_hardfault: !self.run_options.no_catch_hardfault,
                 catch_reset: !self.run_options.no_catch_reset,
