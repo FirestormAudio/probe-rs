@@ -315,7 +315,12 @@ impl<'probe> Armv7ar<'probe> {
 
     /// Sync any updated registers back to the core
     fn writeback_registers(&mut self) -> Result<(), Error> {
-        let writeback_iter = (17u16..=48).chain(15u16..=16).chain(0u16..=14);
+        // ARM DDI0406 §C6.7: Writing CPSR via MSR in Debug state makes the restart
+        // address unknown. The restart address is only predictable if PC is written last
+        // (or written after CPSR with no further CPSR write). So the order must be:
+        //   VFP (17..=48) → CPSR (16) → PC (15) → r0..r14 (0..=14)
+        let writeback_iter = (17u16..=48).chain([16u16, 15u16]).chain(0u16..=14);
+        let mut needs_isb = false;
 
         for i in writeback_iter {
             if let Some((val, writeback)) = self.state.register_cache[i as usize]
@@ -328,21 +333,89 @@ impl<'probe> Armv7ar<'probe> {
                         self.execute_instruction_with_input(instruction, val.try_into()?)?;
                     }
                     15 => {
-                        // Move val to r0
-                        let instruction = build_mrc(14, 0, 0, 0, 5, 0);
+                        let pc_val: u32 = val.try_into()?;
 
-                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
+                        // Load pc_val into r0 via DTRRX.
+                        let load_r0 = build_mrc(14, 0, 0, 0, 5, 0);
+                        self.execute_instruction_with_input(load_r0, pc_val)?;
+
+                        // Clear SCTLR.V (bit 13, HIVEC) so that exceptions use VBAR rather
+                        // than the legacy high-vector page at 0xFFFF0000.
+                        // MRC p15, 0, r0, c1, c0, 0  (read SCTLR → r0)
+                        let read_sctlr = build_mrc(15, 0, 0, 1, 0, 0);
+                        self.execute_instruction(read_sctlr)?;
+                        // BIC r0, r0, #0x2000  (clear bit 13 = HIVEC)
+                        // imm12 = {rot=10, imm8=0x02} → 0x02 ROR 20 = 0x00002000
+                        self.execute_instruction(0xE3C0_0A02)?;
+                        // MCR p15, 0, r0, c1, c0, 0  (write SCTLR ← r0)
+                        let write_sctlr = build_mcr(15, 0, 0, 1, 0, 0);
+                        self.execute_instruction(write_sctlr)?;
+
+                        // ARMv7-A CP15 barriers (cond=AL, safe via DBGITR).
+                        // The newer 0xF57FF04F/06F encodings use cond=0b1111 and are
+                        // CONSTRAINED UNPREDICTABLE via DBGITR (ARM TRM §12.3).
+                        // MCR p15, 0, r0, c7, c10, 4  (DSB)
+                        let dsb_mcr = build_mcr(15, 0, 0, 7, 10, 4);
+                        self.execute_instruction(dsb_mcr)?;
+                        // MCR p15, 0, r0, c7, c5, 4  (ISB)
+                        let isb_mcr = build_mcr(15, 0, 0, 7, 5, 4);
+                        self.execute_instruction(isb_mcr)?;
+                        // Invalidate I-cache (ICIALLU) and branch predictor (BPIALL).
+                        // MCR p15, 0, r0, c7, c5, 0  (ICIALLU)
+                        let iciallu = build_mcr(15, 0, 0, 7, 5, 0);
+                        self.execute_instruction(iciallu)?;
+                        // MCR p15, 0, r0, c7, c5, 6  (BPIALL)
+                        let bpiall = build_mcr(15, 0, 0, 7, 5, 6);
+                        self.execute_instruction(bpiall)?;
+
+                        // Give the device-specific sequence a chance to clear any additional
+                        // stale CPU state (e.g. MMU, other SCTLR bits, banked registers) before
+                        // the CPU is released. The hook may freely use r0 as scratch.
+                        self.sequence.pre_run_writeback(
+                            self.memory.as_mut(),
+                            self.base_address,
+                            pc_val,
+                        )?;
+
+                        // Reload r0 = pc_val (hook may have clobbered r0).
+                        self.execute_instruction_with_input(load_r0, pc_val)?;
 
                         // Use `mov pc, r0` rather than `bx r0` because the `bx` instruction is
                         // `UNPREDICTABLE` in the debug state (ARM Architecture Reference Manual,
                         // ARMv7-A and ARMv7-R edition, C5.3: "Executing instructions in Debug state").
                         let instruction = build_mov(15, 0);
                         self.execute_instruction(instruction)?;
+
+                        // The CPU has restarted; clear the register cache immediately so
+                        // the loop over r0..r14 below finds nothing dirty and does not
+                        // attempt further DBGITR writes to a running core.
+                        self.reset_register_cache();
+                        return Ok(());
                     }
                     16 => {
-                        // msr cpsr_fsxc, r0
-                        let instruction = build_msr(0);
-                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
+                        let cpsr_val: u32 = val.try_into()?;
+                        // CPSR.T (bit 5) indicates Thumb state at halt; DBGITR then decodes
+                        // instructions as Thumb-2. MSR uses the Thumb-2 encoding accordingly;
+                        // after the write the CPU's ISA reverts to ARM for the rest of writeback.
+                        // MRC/MCR p14/p15 coprocessor instructions are identical in both ISAs.
+                        let was_thumb = (cpsr_val >> 5) & 1 == 1;
+                        self.prepare_r0_for_clobber()?;
+                        let load_r0 = build_mrc(14, 0, 0, 0, 5, 0);
+                        self.execute_instruction_with_input(load_r0, cpsr_val)?;
+                        if was_thumb {
+                            // Thumb-2 encoding of `MSR CPSR_fsxc, r0`.
+                            // Verified with arm-none-eabi-as: `msr cpsr_fsxc, r0` → F380 8F00
+                            // DBGITR for T2: MSB halfword in [31:16], LSB halfword in [15:0].
+                            self.execute_instruction(0xF380_8F00)?;
+                        } else {
+                            let msr_cpsr = build_msr(0);
+                            self.execute_instruction(msr_cpsr)?;
+                        }
+                        // ISB required before restart when CPSR was changed (ARM DDI0406
+                        // §B1.8.2: context-changing operations require ISB before exit from
+                        // debug state). When PC is also dirty, case 15 handles this and returns
+                        // early — the flag is only checked on the CPSR-only exit path below.
+                        needs_isb = true;
                     }
                     17..=48 => {
                         // Move value to r0, r1
@@ -365,6 +438,14 @@ impl<'probe> Armv7ar<'probe> {
                     }
                 }
             }
+        }
+
+        if needs_isb {
+            // ISB before restart: ensures the CPU's instruction fetch sees any CPSR changes
+            // that occurred during writeback (e.g. only CPSR dirty, PC not written).
+            // MCR p15, 0, r0, c7, c5, 4  (ISB)
+            let isb_mcr = build_mcr(15, 0, 0, 7, 5, 4);
+            self.execute_instruction(isb_mcr)?;
         }
 
         self.reset_register_cache();
@@ -598,7 +679,7 @@ fn check_and_clear_data_abort(
 }
 
 /// Execute a single instruction.
-fn execute_instruction(
+pub(crate) fn execute_instruction(
     memory: &mut dyn ArmMemoryInterface,
     base_address: u64,
     instruction: u32,
@@ -629,7 +710,7 @@ fn execute_instruction(
 
 /// Set the DBGDBGDTRRX register, which can be accessed with an
 /// `STC p14, c5, ..., #4` instruction.
-fn set_instruction_input(
+pub(crate) fn set_instruction_input(
     memory: &mut dyn ArmMemoryInterface,
     base_address: u64,
     value: u32,
@@ -774,10 +855,11 @@ impl CoreInterface for Armv7ar<'_> {
 
         // try to read the program counter
         let pc_value = self.read_core_reg(self.program_counter().into())?;
+        let pc_u32: u32 = pc_value.try_into().unwrap_or(0xDEAD_BEEF);
 
         // get pc
         Ok(CoreInformation {
-            pc: pc_value.try_into()?,
+            pc: pc_u32.into(),
         })
     }
 
@@ -985,8 +1067,12 @@ impl CoreInterface for Armv7ar<'_> {
                 let instruction = build_mcr(14, 0, 0, 0, 5, 0);
                 let pra_plus_offset = self.execute_instruction_with_result(instruction)?;
 
-                // PC returned is PC + 8
-                Ok((pra_plus_offset - 8).into())
+                // Determine pipeline fill from ISA state at halt:
+                // ARM state: MOV r0, PC returns PRA+8; Thumb state: PRA+4.
+                // (ARM DDI0406 Table 23.1)
+                let cpsr: u32 = self.read_core_reg(RegisterId(16))?.try_into()?;
+                let offset: u32 = if (cpsr >> 5) & 1 == 1 { 4 } else { 8 };
+                Ok((pra_plus_offset - offset).into())
             }
             16 => {
                 // CPSR, must access via r0
@@ -1587,6 +1673,8 @@ impl MemoryInterface for Armv7ar<'_> {
     fn write_32(&mut self, address: u64, data: &[u32]) -> Result<(), Error> {
         self.halted_access(|core| {
             if data.len() > 2 {
+                const DCC_FAST_WRITE_CHUNK_WORDS: usize = 1024;
+
                 // Save r0
                 core.prepare_r0_for_clobber()?;
                 core.set_r0(valid_32bit_address(address)?)?;
@@ -1598,8 +1686,13 @@ impl MemoryInterface for Armv7ar<'_> {
                         // STC p14, c5, [r0], #4
                         banked.set_itr(build_stc(14, 5, 0, 4))?;
 
-                        // Continually write the tx register, which will auto-increment
-                        banked.set_dtrrx_repeated(data)?;
+                        // Stream the payload in bounded chunks. Very large repeated AP writes can
+                        // appear to stall on J-Link with no visible target activity.
+                        for chunk in data.chunks(DCC_FAST_WRITE_CHUNK_WORDS) {
+                            // Continually write the tx register, which will auto-increment.
+                            banked.set_dtrrx_repeated(chunk)?;
+                        }
+
                         Ok(())
                     })
                     .ok();
@@ -1637,28 +1730,44 @@ impl MemoryInterface for Armv7ar<'_> {
             let len = data.len();
             let start_extra_count = ((4 - (address % 4) as usize) % 4).min(len);
             let end_extra_count = (len - start_extra_count) % 4;
+            let inbetween_count = len - start_extra_count - end_extra_count;
             assert!(start_extra_count < 4);
             assert!(end_extra_count < 4);
+            assert!(inbetween_count.is_multiple_of(4));
 
-            // Fall back to slower bytewise access if it's not aligned
-            if start_extra_count != 0 || end_extra_count != 0 {
-                for (i, byte) in data.iter().enumerate() {
+            let mut address = address;
+            let mut data = data;
+
+            if start_extra_count != 0 {
+                for (i, byte) in data[..start_extra_count].iter().enumerate() {
                     core.write_word_8(address + (i as u64), *byte)?;
                 }
-                return Ok(());
+
+                address += start_extra_count as u64;
+                data = &data[start_extra_count..];
             }
 
-            // Make sure we don't try to do an empty but potentially unaligned write
-            // We do a 32 bit write of the remaining bytes that are 4 byte aligned.
-            let mut buffer = vec![0u32; data.len() / 4];
-            let endianness = core.endianness()?;
-            for (bytes, value) in data.chunks_exact(4).zip(buffer.iter_mut()) {
-                *value = match endianness {
-                    Endian::Little => u32::from_le_bytes(bytes.try_into().unwrap()),
-                    Endian::Big => u32::from_be_bytes(bytes.try_into().unwrap()),
+            if inbetween_count > 0 {
+                let aligned = &data[..inbetween_count];
+                let mut buffer = vec![0u32; aligned.len() / 4];
+                let endianness = core.endianness()?;
+                for (bytes, value) in aligned.chunks_exact(4).zip(buffer.iter_mut()) {
+                    *value = match endianness {
+                        Endian::Little => u32::from_le_bytes(bytes.try_into().unwrap()),
+                        Endian::Big => u32::from_be_bytes(bytes.try_into().unwrap()),
+                    }
+                }
+                core.write_32(address, &buffer)?;
+
+                address += inbetween_count as u64;
+                data = &data[inbetween_count..];
+            }
+
+            if end_extra_count > 0 {
+                for (i, byte) in data[..end_extra_count].iter().enumerate() {
+                    core.write_word_8(address + (i as u64), *byte)?;
                 }
             }
-            core.write_32(address, &buffer)?;
 
             Ok(())
         })
@@ -1682,6 +1791,8 @@ impl MemoryInterface for Armv7ar<'_> {
 ///
 /// HLT-based semihosting is preferred as it doesn't interfere with baremetal/OS/RTOS SVC usage.
 /// Spec: <https://github.com/ARM-software/abi-aa/blob/2025Q1/semihosting/semihosting.rst#the-semihosting-interface>
+///
+/// Note: the Thumb HLT immediate is `#0x3C` (AArch32); `#64` / `0x40` is the AArch64 value.
 pub(crate) fn check_for_semihosting(
     cached_command: Option<SemihostingCommand>,
     core: &mut dyn CoreInterface,
@@ -1706,8 +1817,8 @@ pub(crate) fn check_for_semihosting(
 
     let vector_offset = pc & VECTOR_TABLE_MASK;
 
-    // Early return if we're not at a semihosting vector, to not reading potentially invalid memory
-    // at LR-4
+    // Early return if not at a semihosting vector, to avoid reading potentially invalid memory
+    // at LR-4.
     if vector_offset != UNDEF_VECTOR_OFFSET && vector_offset != SVC_VECTOR_OFFSET {
         tracing::debug!(
             "Vector catch at PC={:#x} (offset {:#x}), not SVC/UNDEF vector, not semihosting",
@@ -1723,7 +1834,7 @@ pub(crate) fn check_for_semihosting(
     // - Thumb state: `SVC #0xAB`     encoded as 0xDFAB
     // HLT-based:
     // - ARM state:   `HLT #0xF000`   encoded as 0xE10F0070
-    // - Thumb state: `HLT #64`       encoded as 0xBABC
+    // - Thumb state: `HLT #0x3C`     encoded as 0xBABC
     const ARM_SEMIHOSTING_SVC: [u8; 4] = 0xEF123456_u32.to_le_bytes();
     const THUMB_SEMIHOSTING_SVC: [u8; 2] = 0xDFAB_u16.to_le_bytes();
     const ARM_SEMIHOSTING_HLT: [u8; 4] = 0xE10F0070_u32.to_le_bytes();
