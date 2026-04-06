@@ -1,5 +1,7 @@
 //! Renesas vendor support.
 
+pub mod sequences;
+
 use std::borrow::Cow;
 
 use jep106::JEP106Code;
@@ -15,6 +17,8 @@ use crate::{
     vendor::Vendor,
 };
 
+use sequences::rza1l::RZA1L;
+
 /// Renesas
 #[derive(docsplay::Display)]
 pub struct Renesas;
@@ -22,7 +26,13 @@ pub struct Renesas;
 const JEP_RENESAS: JEP106Code = JEP106Code::new(0x4, 0x23);
 
 impl Vendor for Renesas {
-    fn try_create_debug_sequence(&self, _chip: &Chip) -> Option<DebugSequence> {
+    fn try_create_debug_sequence(&self, chip: &Chip) -> Option<DebugSequence> {
+        // Match on the chip family name prefix to assign the RZA1L sequence to all
+        // R7S721010/020/030 variants.
+        let name = chip.name.as_str();
+        if name.starts_with("R7S721") {
+            return Some(DebugSequence::Arm(RZA1L::create()));
+        }
         None
     }
 

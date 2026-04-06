@@ -1,0 +1,178 @@
+# Renesas RZ/A1L Group (R7S721010), RZ/A1LU (R7S721020), RZ/A1LC (R7S721030)
+# All are single-core Cortex-A9 (ARMv7-A) with CoreSight debug infrastructure.
+#
+# JTAG scan chain note (TRM §43):
+#   The BSCANP pin selects the active JTAG TAP:
+#     BSCANP=0: CoreSight debug TAP (ARM JTAG-DP, ir_len=4) - normal debug
+#     BSCANP=1: Boundary-scan TAP  (ir_len=8, BSID=0x081A6447) - mfg test only
+#   For probe-rs we always operate in CoreSight debug mode (BSCANP=0).
+#
+# CoreSight address map (TRM Table 43.6, "Debug-APB Address viewed from Debugger"):
+#   0x80000000: DAP ROM table
+#   0x80030000: CA9-DBG (CPU0 debug registers)
+#   0x80038000: CA9-CTI (CPU0 cross-trigger interface)
+#
+# AP topology:
+#   AP0: MEM-AP mastering the AHB bus (SDRAM, SRAM, peripherals)
+#   AP1: APB-AP mastering the debug-APB bus (CoreSight components)
+#   Debug component access goes through AP1 (debug-APB addresses above).
+#
+# RTT notes:
+#   Internal SRAM (0x20000000) is in the data cache domain. If the Cortex-A9
+#   cache is enabled, probe-rs reads via MEM-AP will see stale cached data.
+#   Workaround: place the RTT control block in the non-cached SRAM mirror
+#   at 0x60000000-0x6009FFFF (MMU area 10, NORMAL_NOT_CACHED).
+#   The rtt_scan_ranges below include both regions.
+---
+name: RZ/A1L Series
+manufacturer:
+  id: 0x23
+  cc: 0x4
+variants:
+  - name: R7S721010
+    cores:
+      - name: core0
+        type: armv7a
+        core_access_options: !Arm
+          ap: !v1 1
+          debug_base: 0x80030000
+          cti_base: 0x80038000
+          jtag_tap: 0
+    jtag:
+      scan_chain:
+        - name: RZA1L
+          ir_len: 4
+    rtt_scan_ranges:
+      - start: 0x20000000
+        end: 0x2009FFFF
+      - start: 0x60000000
+        end: 0x6009FFFF
+      - start: 0x0C000000
+        end: 0x0FFFFFFF
+    memory_map:
+      - !Nvm
+        name: NOR_CS0
+        range:
+          start: 0x00000000
+          end: 0x03FFFFFF
+        cores:
+          - core0
+      - !Ram
+        name: InternalSRAM
+        range:
+          start: 0x20000000
+          end: 0x202FFFFF
+        cores:
+          - core0
+      - !Ram
+        name: InternalSRAM_NonCached
+        range:
+          start: 0x60000000
+          end: 0x602FFFFF
+        cores:
+          - core0
+      - !Ram
+        name: SDRAM_CS3
+        range:
+          start: 0x0C000000
+          end: 0x0FFFFFFF
+        cores:
+          - core0
+  - name: R7S721020
+    cores:
+      - name: core0
+        type: armv7a
+        core_access_options: !Arm
+          ap: !v1 1
+          debug_base: 0x80030000
+          cti_base: 0x80038000
+          jtag_tap: 0
+    jtag:
+      scan_chain:
+        - name: RZA1LU
+          ir_len: 4
+    rtt_scan_ranges:
+      - start: 0x20000000
+        end: 0x2009FFFF
+      - start: 0x60000000
+        end: 0x6009FFFF
+      - start: 0x0C000000
+        end: 0x0FFFFFFF
+    memory_map:
+      - !Nvm
+        name: NOR_CS0
+        range:
+          start: 0x00000000
+          end: 0x03FFFFFF
+        cores:
+          - core0
+      - !Ram
+        name: InternalSRAM
+        range:
+          start: 0x20000000
+          end: 0x202FFFFF
+        cores:
+          - core0
+      - !Ram
+        name: InternalSRAM_NonCached
+        range:
+          start: 0x60000000
+          end: 0x602FFFFF
+        cores:
+          - core0
+      - !Ram
+        name: SDRAM_CS3
+        range:
+          start: 0x0C000000
+          end: 0x0FFFFFFF
+        cores:
+          - core0
+  - name: R7S721030
+    cores:
+      - name: core0
+        type: armv7a
+        core_access_options: !Arm
+          ap: !v1 1
+          debug_base: 0x80030000
+          cti_base: 0x80038000
+          jtag_tap: 0
+    jtag:
+      scan_chain:
+        - name: RZA1LC
+          ir_len: 4
+    rtt_scan_ranges:
+      - start: 0x20000000
+        end: 0x2009FFFF
+      - start: 0x60000000
+        end: 0x6009FFFF
+      - start: 0x0C000000
+        end: 0x0FFFFFFF
+    memory_map:
+      - !Nvm
+        name: NOR_CS0
+        range:
+          start: 0x00000000
+          end: 0x03FFFFFF
+        cores:
+          - core0
+      - !Ram
+        name: InternalSRAM
+        range:
+          start: 0x20000000
+          end: 0x202FFFFF
+        cores:
+          - core0
+      - !Ram
+        name: InternalSRAM_NonCached
+        range:
+          start: 0x60000000
+          end: 0x602FFFFF
+        cores:
+          - core0
+      - !Ram
+        name: SDRAM_CS3
+        range:
+          start: 0x0C000000
+          end: 0x0FFFFFFF
+        cores:
+          - core0
