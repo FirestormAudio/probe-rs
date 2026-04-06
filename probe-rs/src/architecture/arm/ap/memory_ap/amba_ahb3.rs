@@ -1,6 +1,9 @@
 use crate::architecture::arm::{
     ArmError, DapAccess, FullyQualifiedApAddress, RegisterParseError,
-    ap::{AccessPortType, ApAccess, ApRegAccess, ApRegister, CFG, define_ap_register},
+    ap::{
+        AccessPortType, ApAccess, ApRegAccess, ApRegister, BASE, BASE2, BaseAddrFormat, CFG,
+        define_ap_register,
+    },
 };
 
 use super::{AddressIncrement, DataSize};
@@ -44,6 +47,29 @@ impl AmbaAhb3 {
 
 impl super::MemoryApType for AmbaAhb3 {
     type CSW = CSW;
+
+    fn base_address<P: ApAccess + ?Sized>(&self, probe: &mut P) -> Result<u64, ArmError> {
+        let base_register: BASE = probe.read_ap_register(self)?;
+        let raw_base = u32::from(base_register);
+
+        if raw_base == 0 || base_register.BASEADDR == 0x000f_ffff {
+            return Err(ArmError::Other("debug entry not present".to_string()));
+        }
+
+        if !base_register.present {
+            return Err(ArmError::Other("debug entry not present".to_string()));
+        }
+
+        let mut base_address = if BaseAddrFormat::ADIv5 == base_register.Format {
+            let base2: BASE2 = probe.read_ap_register(self)?;
+            u64::from(base2.BASEADDR) << 32
+        } else {
+            0
+        };
+        base_address |= u64::from(base_register.BASEADDR << 12);
+
+        Ok(base_address)
+    }
 
     fn status<P: ApAccess + ?Sized>(&mut self, probe: &mut P) -> Result<CSW, ArmError> {
         const { assert!(crate::architecture::arm::ap::CSW::ADDRESS == CSW::ADDRESS) };

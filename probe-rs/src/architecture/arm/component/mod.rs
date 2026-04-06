@@ -1,7 +1,12 @@
 //! Types and functions for interacting with CoreSight Components
 
+use std::time::{Duration, Instant};
+
 mod dwt;
 mod itm;
+mod ptm;
+pub mod ptm_decoder;
+mod pmu;
 mod scs;
 mod swo;
 mod tmc;
@@ -20,9 +25,11 @@ use crate::{
 
 pub use self::itm::Itm;
 pub use dwt::Dwt;
+pub use pmu::{PerformanceMonitoringUnit, PmuEvent, PmuSnapshot};
+pub use ptm::ProgramTraceMacrocell;
 pub use scs::Scs;
 pub use swo::Swo;
-pub use tmc::TraceMemoryController;
+pub use tmc::{Mode as TmcMode, TraceMemoryController};
 pub use tpiu::Tpiu;
 pub use trace_funnel::TraceFunnel;
 
@@ -41,7 +48,36 @@ pub enum TraceSink {
     Tpiu(SwoConfig),
 
     /// Trace data should be sent to the embedded trace buffer for software-based trace collection.
-    TraceMemory,
+    TraceMemory(TraceMemoryConfig),
+}
+
+/// PTM/ETF trace-memory configuration.
+#[derive(Debug, Copy, Clone, Default)]
+pub struct TraceMemoryConfig {
+    /// Enable PTM timestamp packets when the trace source advertises support.
+    pub timestamps: bool,
+    /// Enable PTM return-stack packets when the trace source advertises support.
+    pub return_stack: bool,
+    /// Enable PTM branch-broadcast mode (ETMCR bit[8]).
+    ///
+    /// In branch-broadcast mode the PTM emits a branch address packet for every executed
+    /// branch, including direct (compile-time-known) branches.  This allows offline
+    /// execution reconstruction without an ELF, at the cost of higher trace bandwidth.
+    pub branch_broadcast: bool,
+}
+
+/// Reports which optional PTM features were actually activated during trace setup.
+///
+/// Returned by [`setup_tracing`] so callers can emit clear diagnostics when a requested feature
+/// was not advertised by the connected trace source.
+#[derive(Debug, Copy, Clone, Default)]
+pub struct TraceEnabledFeatures {
+    /// True if timestamp packets will be emitted by the PTM.
+    pub timestamps: bool,
+    /// True if the PTM return-stack was enabled.
+    pub return_stack: bool,
+    /// True if branch-broadcast mode was enabled.
+    pub branch_broadcast: bool,
 }
 
 /// An error when operating a core ROM table component occurred.
@@ -100,6 +136,56 @@ pub trait DebugComponentInterface:
             self.clone().into(),
         )
     }
+}
+
+fn wait_for_tmc_ready(tmc: &mut TraceMemoryController<'_>, context: &str) -> Result<(), ArmError> {
+    const TMC_READY_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let start = Instant::now();
+    while !tmc.ready().map_err(|e| ArmError::Other(e.to_string()))? {
+        if start.elapsed() >= TMC_READY_TIMEOUT {
+            let empty = tmc.empty().map_err(|e| ArmError::Other(e.to_string()))?;
+            let full = tmc.full().map_err(|e| ArmError::Other(e.to_string()))?;
+            let triggered = tmc.triggered().map_err(|e| ArmError::Other(e.to_string()))?;
+            let fill_level = tmc
+                .fill_level()
+                .map_err(|e| ArmError::Other(e.to_string()))?;
+
+            return Err(ArmError::Other(format!(
+                "Timed out waiting for ETF ready during {context} after {:?} (empty={empty}, full={full}, triggered={triggered}, fill_level={fill_level})",
+                start.elapsed()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn tmc_words_available_before_stop(
+    tmc: &mut TraceMemoryController<'_>,
+) -> Result<usize, ArmError> {
+    let fifo_size = tmc.fifo_size()? as usize;
+    let fill_level = tmc.fill_level().map_err(|e| ArmError::Other(e.to_string()))? as usize;
+    let read_pointer = tmc.read_pointer()? as usize;
+    let write_pointer = tmc.write_pointer()? as usize;
+    let full_buffer = tmc.full().map_err(|e| ArmError::Other(e.to_string()))?
+        || tmc.triggered().map_err(|e| ArmError::Other(e.to_string()))?;
+
+    let pointer_distance = if fifo_size == 0 {
+        0
+    } else if write_pointer >= read_pointer {
+        write_pointer - read_pointer
+    } else {
+        fifo_size - ((read_pointer - write_pointer) % fifo_size)
+    };
+
+    let bytes_to_read = if full_buffer {
+        fifo_size
+    } else {
+        fill_level.max(pointer_distance).min(fifo_size)
+    };
+
+    Ok(bytes_to_read / core::mem::size_of::<u32>())
 }
 
 /// Reads all the available ARM CoresightComponents of the currently attached target.
@@ -199,20 +285,28 @@ fn configure_tpiu(
 /// Sets up all the SWV components.
 ///
 /// Expects to be given a list of all ROM table `components` as the second argument.
+///
+/// Returns [`TraceEnabledFeatures`] describing which optional PTM features were actually
+/// activated.  For non-`TraceMemory` sinks the returned struct will always be all-false.
 pub(crate) fn setup_tracing(
     interface: &mut dyn ArmDebugInterface,
     components: &[CoresightComponent],
     sink: &TraceSink,
-) -> Result<(), Error> {
-    // Configure DWT
-    let mut dwt = Dwt::new(interface, find_component(components, PeripheralType::Dwt)?);
-    dwt.enable()?;
-    dwt.enable_exception_trace()?;
+) -> Result<TraceEnabledFeatures, Error> {
+    let mut enabled = TraceEnabledFeatures::default();
+    // Configure DWT/ITM when present. Cortex-A/R trace paths may provide PTM + funnel +
+    // ETF/TPIU without M-profile DWT/ITM blocks.
+    if let Ok(dwt_component) = find_component(components, PeripheralType::Dwt) {
+        let mut dwt = Dwt::new(interface, dwt_component);
+        dwt.enable()?;
+        dwt.enable_exception_trace()?;
+    }
 
-    // Configure ITM
-    let mut itm = Itm::new(interface, find_component(components, PeripheralType::Itm)?);
-    itm.unlock()?;
-    itm.tx_enable()?;
+    if let Ok(itm_component) = find_component(components, PeripheralType::Itm) {
+        let mut itm = Itm::new(interface, itm_component);
+        itm.unlock()?;
+        itm.tx_enable()?;
+    }
 
     // Configure the trace destination.
     match sink {
@@ -247,25 +341,41 @@ pub(crate) fn setup_tracing(
             }
         }
 
-        TraceSink::TraceMemory => {
+        TraceSink::TraceMemory(config) => {
             let mut tmc = TraceMemoryController::new(
                 interface,
                 find_component(components, PeripheralType::Tmc)?,
             );
 
-            // Clear out the TMC FIFO before initiating the capture.
+            // Clear out the TMC FIFO and restart capture. The mode (Software or Circular) was
+            // already set by trace_start() — either the default (Software) or a device-specific
+            // override (e.g. Circular for RZA1L). Changing the mode here would override that.
             tmc.disable_capture()?;
-            while !tmc.ready()? {}
-
-            // Configure the TMC for software-polled mode, as we will read out data using the debug
-            // interface.
-            tmc.set_mode(tmc::Mode::Software)?;
+            wait_for_tmc_ready(&mut tmc, "trace setup")?;
+            tmc.enable_formatter()?;
 
             tmc.enable_capture()?;
+
+            // Enable any PTM (Program Trace Macrocell) sources found in the ROM table.
+            // PTMs are present on ARMv7-A/R cores (Cortex-A5/A7/A8/A9/A15, Cortex-R4/R5).
+            // Trace IDs are assigned starting at 1; each PTM on the ATB bus needs a unique ID.
+            for (idx, ptm_component) in components
+                .iter()
+                .filter_map(|c| c.find_component(PeripheralType::Ptm))
+                .enumerate()
+            {
+                let trace_id = (idx + 1) as u8;
+                let mut ptm = ProgramTraceMacrocell::new(interface, ptm_component);
+                // OR-accumulate: a feature is reported as enabled if any PTM on this ATB bus
+                // activates it (all PTMs are configured identically so this is typically all-or-nothing).
+                let ptm_features = ptm.enable(trace_id, *config)?;
+                enabled.timestamps |= ptm_features.timestamps;
+                enabled.return_stack |= ptm_features.return_stack;
+            }
         }
     }
 
-    Ok(())
+    Ok(enabled)
 }
 
 /// Read trace data from internal trace memory
@@ -289,57 +399,156 @@ pub(crate) fn read_trace_memory(
     let mut tmc =
         TraceMemoryController::new(interface, find_component(components, PeripheralType::Tmc)?);
 
-    let fifo_size = tmc.fifo_size()?;
+    let words_to_read = tmc_words_available_before_stop(&mut tmc)?;
 
-    // This sequence is taken from "CoreSight Trace memory Controller Technical Reference Manual"
-    // Section 2.2.2 "Software FIFO Mode". Without following this procedure, the trace data does
-    // not properly stop even after disabling capture.
+    // Stop capture before draining. Without this, data could be written while being read,
+    // causing corrupted frames — especially critical in Circular mode.
+    tmc.disable_capture().map_err(|e| ArmError::Other(e.to_string()))?;
+    wait_for_tmc_ready(&mut tmc, "trace memory drain")?;
 
-    // Read all of the data from the ETM into a vector for further processing.
+    // Drain the ETF via the RRD register.
+    //
+    // In software FIFO mode the RRD register eventually returns the 0xFFFF_FFFF sentinel.
+    // In circular-buffer ETF mode on RZ/A1L, relying on that sentinel can hang indefinitely,
+    // so we bound the read count from the pre-stop fill level or full buffer size.
     let mut etf_trace: Vec<u8> = Vec::new();
-    loop {
+    for _ in 0..words_to_read {
         match tmc.read()? {
             Some(data) => etf_trace.extend_from_slice(&data.to_le_bytes()),
-            None => {
-                // If there's nothing available in the FIFO, we can only break out of reading if we
-                // have an integer number of formatted frames, which are 16 bytes each.
-                if etf_trace.len().is_multiple_of(16) {
-                    break;
-                }
-            }
-        }
-
-        // If the FIFO is being filled faster than we can read it, break out after reading a
-        // maximum number of frames.
-        let frame_boundary = etf_trace.len().is_multiple_of(16);
-
-        if frame_boundary && etf_trace.len() >= fifo_size as usize {
-            break;
+            None => break,
         }
     }
 
-    // The TMC formats data into frames, as it contains trace data from multiple data sources. We
-    // need to deserialize the frames and pull out only the data source of interest. For now, all
-    // we care about is the ITM data.
-
+    // The TMC formats data into frames, each 16 bytes, from multiple trace sources.
+    // Extract only ITM data (ATID 13, set by Itm::tx_enable()).
     let mut id = 0.into();
     let mut itm_trace = Vec::new();
 
-    // Process each formatted frame and extract the multiplexed trace data.
     for frame_buffer in etf_trace.chunks_exact(16) {
         let mut frame = tmc::Frame::new(frame_buffer, id);
-        for (id, data) in &mut frame {
-            match id.into() {
+        for (fid, data) in &mut frame {
+            match fid.into() {
                 // ITM ATID, see Itm::tx_enable()
-                13 => itm_trace.push(data),
-                0 => (),
-                id => tracing::warn!("Unexpected trace source ATID {id}: {data}, ignoring"),
+                13u8 => itm_trace.push(data),
+                0u8 => (),
+                other => tracing::warn!("Unexpected trace source ATID {other}: {data:#04x}, ignoring"),
             }
         }
         id = frame.id();
     }
 
     Ok(itm_trace)
+}
+
+/// Read PTM instruction trace data from the ETF circular buffer.
+///
+/// Stops ETF capture, drains the buffer, demultiplexes frames filtering to the specified PTM
+/// trace ID, then re-enables capture so tracing continues (the circular buffer will resume
+/// overwriting oldest data).
+///
+/// # Args
+/// * `interface` - The debug probe interface.
+/// * `components` - CoreSight components from the ROM table.
+/// * `trace_id` - The ATB trace source ID assigned to the PTM (set by [`ProgramTraceMacrocell::enable`]).
+///   Typically `1` for the first (and only) PTM on a Cortex-A9.
+pub(crate) fn read_ptm_trace_memory(
+    interface: &mut dyn ArmDebugInterface,
+    components: &[CoresightComponent],
+    trace_id: u8,
+) -> Result<Vec<u8>, ArmError> {
+    let mut tmc =
+        TraceMemoryController::new(interface, find_component(components, PeripheralType::Tmc)?);
+
+    let words_to_read = tmc_words_available_before_stop(&mut tmc)?;
+
+    // Stop capture; wait until ETF pipelines are fully drained.
+    tmc.disable_capture().map_err(|e| ArmError::Other(e.to_string()))?;
+    wait_for_tmc_ready(&mut tmc, "PTM trace drain")?;
+
+    // Drain via RRD using a bounded word count.
+    let mut raw: Vec<u8> = Vec::new();
+    for _ in 0..words_to_read {
+        match tmc.read()? {
+            Some(word) => raw.extend_from_slice(&word.to_le_bytes()),
+            None => break,
+        }
+    }
+
+    // Re-enable capture so circular tracing resumes immediately.
+    tmc.enable_capture().map_err(|e| ArmError::Other(e.to_string()))?;
+
+    Ok(choose_best_ptm_bytes(&raw, trace_id))
+}
+
+fn choose_best_ptm_bytes(raw: &[u8], trace_id: u8) -> Vec<u8> {
+    // In circular mode the oldest byte can land mid-frame. Try all formatter frame offsets and a
+    // small set of initial IDs, then keep the candidate that yields the most decodable PTM data.
+    let mut best_bytes = Vec::new();
+    let mut best_score = 0usize;
+
+    for offset in 0..16 {
+        if raw.len() <= offset {
+            continue;
+        }
+
+        for initial_id in [0u8, trace_id] {
+            let ptm_bytes = extract_ptm_bytes(&raw[offset..], trace_id, initial_id);
+            let score = ptm_decoder::Decoder::new(&ptm_bytes, 0).count();
+
+            if score > best_score || (score == best_score && ptm_bytes.len() > best_bytes.len()) {
+                best_score = score;
+                best_bytes = ptm_bytes;
+            }
+        }
+    }
+
+    best_bytes
+}
+
+fn extract_ptm_bytes(raw: &[u8], trace_id: u8, initial_id: u8) -> Vec<u8> {
+    let mut id = initial_id.into();
+    let mut ptm_bytes = Vec::new();
+
+    for chunk in raw.chunks_exact(16) {
+        let mut frame = tmc::Frame::new(chunk, id);
+        for (fid, data) in &mut frame {
+            let atid: u8 = fid.into();
+            if atid == trace_id {
+                ptm_bytes.push(data);
+            }
+        }
+        id = frame.id();
+    }
+
+    ptm_bytes
+}
+
+/// Configure the PMU to count the given events and enable it.
+///
+/// Call this while the core is halted.  After returning, resume the core and
+/// let it run.  Later, halt the core again and call [`snapshot_pmu`] to read
+/// the accumulated counts.
+pub(crate) fn configure_pmu(
+    interface: &mut dyn ArmDebugInterface,
+    components: &[CoresightComponent],
+    events: &[PmuEvent],
+) -> Result<(), ArmError> {
+    let mut pmu =
+        PerformanceMonitoringUnit::new(interface, find_component(components, PeripheralType::Pmu)?);
+    pmu.configure(events)
+}
+
+/// Read a snapshot of PMU counter values.
+///
+/// Call this while the core is halted (typically after `configure_pmu` + run).
+pub(crate) fn snapshot_pmu(
+    interface: &mut dyn ArmDebugInterface,
+    components: &[CoresightComponent],
+    events: &[PmuEvent],
+) -> Result<PmuSnapshot, ArmError> {
+    let mut pmu =
+        PerformanceMonitoringUnit::new(interface, find_component(components, PeripheralType::Pmu)?);
+    pmu.read_results(events)
 }
 
 /// Configures DWT trace unit `unit` to begin tracing `address`.
@@ -383,4 +592,62 @@ pub fn disable_swv(core: &mut Core) -> Result<(), Error> {
     demcr.set_dwtena(false);
     core.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_single_id_frame(trace_id: u8, payload: &[u8]) -> [u8; 16] {
+        assert!(payload.len() <= 14);
+
+        let mut frame = [0u8; 16];
+        frame[0] = (trace_id << 1) | 1;
+        if let Some(&first_byte) = payload.first() {
+            frame[1] = first_byte;
+        }
+
+        for (idx, &byte) in payload.iter().enumerate().skip(1) {
+            let frame_idx = idx + 1;
+            if frame_idx >= 15 {
+                break;
+            }
+
+            if frame_idx & 1 == 0 {
+                frame[frame_idx] = byte & 0xFE;
+                if byte & 1 != 0 {
+                    frame[15] |= 1 << (frame_idx >> 1);
+                }
+            } else {
+                frame[frame_idx] = byte;
+            }
+        }
+
+        frame
+    }
+
+    #[test]
+    fn circular_ptm_extraction_recovers_from_mid_frame_start() {
+        let trace_id = 1;
+        let mut ptm = vec![0x00; 5];
+        ptm.extend([0x80, 0x08, 0x10, 0x00, 0x00, 0x00, 0xD3]);
+
+        let frame = encode_single_id_frame(trace_id, &ptm);
+        let mut raw = vec![0xAA, 0x55, 0xCC, 0x33, 0x77];
+        raw.extend_from_slice(&frame);
+
+        let extracted = choose_best_ptm_bytes(&raw, trace_id);
+        assert!(extracted.starts_with(&ptm));
+
+        let packets: Vec<_> = ptm_decoder::Decoder::new(&extracted, 0).collect();
+        assert!(packets.iter().any(|packet| matches!(packet, ptm_decoder::PtmPacket::Sync)));
+        assert!(packets.iter().any(|packet| matches!(
+            packet,
+            ptm_decoder::PtmPacket::ISync {
+                pc: 0x10,
+                cpsr_low8: 0xD3,
+                context_id: 0,
+            }
+        )));
+    }
 }

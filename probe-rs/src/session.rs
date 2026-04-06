@@ -4,7 +4,7 @@ use crate::{
         arm::{
             ArmError, FullyQualifiedApAddress, SwoReader,
             communication_interface::ArmDebugInterface,
-            component::{TraceSink, get_arm_components},
+            component::{PmuEvent, PmuSnapshot, TraceEnabledFeatures, TraceSink, get_arm_components},
             dp::DpAddress,
             memory::CoresightComponent,
             sequences::{ArmDebugSequence, DefaultArmSequence},
@@ -693,7 +693,7 @@ impl Session {
                 panic!("Probe-rs does not yet support reading parallel trace ports");
             }
 
-            TraceSink::TraceMemory => {
+            TraceSink::TraceMemory(_) => {
                 let components = self.get_arm_components(DpAddress::Default)?;
                 let interface = self.get_arm_interface()?;
                 crate::architecture::arm::component::read_trace_memory(interface, &components)
@@ -701,7 +701,86 @@ impl Session {
         }
     }
 
-    /// Returns an implementation of [std::io::Read] that wraps [SwoAccess::read_swo].
+    /// Read raw PTM instruction trace bytes from the ETF circular buffer.
+    ///
+    /// This stops ETF capture, drains the buffer, extracts bytes matching `trace_id`
+    /// (the ATB trace source ID assigned to the PTM — typically `1`), then re-enables
+    /// capture so circular tracing resumes.
+    ///
+    /// Must be called after [`Session::setup_tracing`] with [`TraceSink::TraceMemory`].
+    pub fn read_ptm_trace_data(&mut self, trace_id: u8) -> Result<Vec<u8>, ArmError> {
+        match self
+            .configured_trace_sink
+            .as_ref()
+            .ok_or(ArmError::TracingUnconfigured)?
+        {
+            TraceSink::TraceMemory(_) => {}
+            _ => return Err(ArmError::TracingUnconfigured),
+        }
+        let components = self.get_arm_components(DpAddress::Default)?;
+        let interface = self.get_arm_interface()?;
+        crate::architecture::arm::component::read_ptm_trace_memory(interface, &components, trace_id)
+    }
+
+    /// Run PMU profiling on the given core.
+    ///
+    /// This method:
+    /// 1. Halts the core (if not already halted).
+    /// 2. Configures the PMU to count `events` and enables it.
+    /// 3. Resumes the core.
+    /// 4. Waits `duration` for the target to run.
+    /// 5. Halts the core again.
+    /// 6. Reads and returns a [`PmuSnapshot`] with cycle + event counts.
+    ///
+    /// # Notes
+    /// - Requires the target to expose a PMU CoreSight component in its ROM table.
+    /// - The Cortex-A9 PMU supports up to 6 event counters simultaneously (`events` is
+    ///   silently truncated to the hardware limit).
+    pub fn pmu_profile(
+        &mut self,
+        core_index: usize,
+        events: &[PmuEvent],
+        duration: Duration,
+    ) -> Result<PmuSnapshot, Error> {
+        use std::thread::sleep;
+
+        // Halt the core before configuring the PMU.
+        {
+            let mut core = self.core(core_index)?;
+            if !core.core_halted()? {
+                core.halt(Duration::from_millis(500))?;
+            }
+        }
+
+        // Configure the PMU (requires ArmDebugInterface + ROM table walk).
+        let components = self.get_arm_components(DpAddress::Default)?;
+        {
+            let interface = self.get_arm_interface()?;
+            crate::architecture::arm::component::configure_pmu(interface, &components, events)
+                .map_err(Error::Arm)?;
+        }
+
+        // Resume the core so it runs and accumulates counts.
+        {
+            let mut core = self.core(core_index)?;
+            core.run()?;
+        }
+
+        // Let the target run for the requested duration.
+        sleep(duration);
+
+        // Halt the core so we can read stable counter values.
+        {
+            let mut core = self.core(core_index)?;
+            core.halt(Duration::from_millis(500))?;
+        }
+
+        // Read the snapshot.
+        let interface = self.get_arm_interface()?;
+        crate::architecture::arm::component::snapshot_pmu(interface, &components, events)
+            .map_err(Error::Arm)
+    }
+
     ///
     /// The implementation buffers all available bytes from
     /// [SwoAccess::read_swo] on each [std::io::Read::read],
@@ -919,15 +998,24 @@ impl Session {
     }
 
     /// Configure the target and probe for serial wire view (SWV) tracing.
+    ///
+    /// Returns [`TraceEnabledFeatures`] describing which optional PTM features were actually
+    /// activated.  For SWO/TPIU sinks this will always be all-false.
     pub fn setup_tracing(
         &mut self,
         core_index: usize,
         destination: TraceSink,
-    ) -> Result<(), Error> {
+    ) -> Result<TraceEnabledFeatures, Error> {
         // Enable tracing on the target
         {
             let mut core = self.core(core_index)?;
-            crate::architecture::arm::component::enable_tracing(&mut core)?;
+            match core.core_type() {
+                CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {
+                    crate::architecture::arm::component::enable_tracing(&mut core)?;
+                }
+                // ARMv7-A/R targets use PTM trace, not DWT/ITM; enable_tracing is M-profile only.
+                _ => {}
+            }
         }
 
         let sequence_handle = match &self.target.debug_sequence {
@@ -947,15 +1035,15 @@ impl Session {
             TraceSink::Tpiu(ref config) => {
                 interface.enable_swo(config)?;
             }
-            TraceSink::TraceMemory => {}
+            TraceSink::TraceMemory(_) => {}
         }
 
         sequence_handle.trace_start(interface, &components, &destination)?;
-        crate::architecture::arm::component::setup_tracing(interface, &components, &destination)?;
+        let enabled = crate::architecture::arm::component::setup_tracing(interface, &components, &destination)?;
 
         self.configured_trace_sink.replace(destination);
 
-        Ok(())
+        Ok(enabled)
     }
 
     /// Configure the target to stop emitting SWV trace data.

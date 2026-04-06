@@ -262,6 +262,10 @@ impl AccessPortType for MemoryAp {
 impl MemoryApType for MemoryAp {
     type CSW = CSW;
 
+    fn base_address<I: ApAccess>(&self, interface: &mut I) -> Result<u64, ArmError> {
+        mem_ap_forward!(self, base_address(interface))
+    }
+
     fn has_large_address_extension(&self) -> bool {
         mem_ap_forward!(self, has_large_address_extension())
     }

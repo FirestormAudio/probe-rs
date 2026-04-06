@@ -1,8 +1,8 @@
 use crate::architecture::arm::{
     ArmError, DapAccess, FullyQualifiedApAddress, RegisterParseError,
     ap::{
-        AccessPortType, AddressIncrement, ApAccess, ApRegAccess, ApRegister, CFG, DataSize,
-        define_ap_register,
+        AccessPortType, AddressIncrement, ApAccess, ApRegAccess, ApRegister, BASE, BASE2,
+        BaseAddrFormat, CFG, DataSize, define_ap_register,
     },
 };
 
@@ -41,6 +41,36 @@ impl AmbaApb2Apb3 {
 
 impl super::MemoryApType for AmbaApb2Apb3 {
     type CSW = CSW;
+
+    fn base_address<P: ApAccess + ?Sized>(&self, probe: &mut P) -> Result<u64, ArmError> {
+        let base_register: BASE = probe.read_ap_register(self)?;
+        let raw_base = u32::from(base_register);
+
+        if !base_register.present {
+            let base_address = u64::from(raw_base & 0xFFFF_F000);
+
+            if base_address != 0 {
+                tracing::warn!(
+                    raw_base = format_args!("{raw_base:#010x}"),
+                    base_address = format_args!("{base_address:#010x}"),
+                    "Using raw APB-AP BASE value without ADIv5 present bit"
+                );
+                return Ok(base_address);
+            }
+
+            return Err(ArmError::Other("debug entry not present".to_string()));
+        }
+
+        let mut base_address = if BaseAddrFormat::ADIv5 == base_register.Format {
+            let base2: BASE2 = probe.read_ap_register(self)?;
+            u64::from(base2.BASEADDR) << 32
+        } else {
+            0
+        };
+        base_address |= u64::from(base_register.BASEADDR << 12);
+
+        Ok(base_address)
+    }
 
     fn status<P: ApAccess + ?Sized>(&mut self, probe: &mut P) -> Result<CSW, ArmError> {
         const { assert!(crate::architecture::arm::ap::CSW::ADDRESS == CSW::ADDRESS) };

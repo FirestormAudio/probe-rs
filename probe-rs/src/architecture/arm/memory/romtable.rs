@@ -758,6 +758,10 @@ impl PeripheralID {
             ("ARM Ltd", 0x923, 0x11, 0x0000) => Some(PartInfo::new("Cortex-M3 TPIU", PeripheralType::Tpiu)),
             ("ARM Ltd", 0x924, 0x13, 0x0000) => Some(PartInfo::new("Cortex-M3 ETM", PeripheralType::Etm)),
             ("ARM Ltd", 0x925, 0x13, 0x0000) => Some(PartInfo::new("Cortex-M4 ETM", PeripheralType::Etm)),
+            // PTM (Program Trace Macrocell) - ARMv7-A/R, ARM DDI 0314H
+            // PART 0x950 = PTM-A5/A8/A9/A15, 0x95A = PTM-A9r3 (used in RZ/A1L)
+            ("ARM Ltd", 0x950, 0x13, 0x0000) => Some(PartInfo::new("Cortex-A PTM", PeripheralType::Ptm)),
+            ("ARM Ltd", 0x95A, 0x13, 0x0000) => Some(PartInfo::new("Cortex-A9 PTM", PeripheralType::Ptm)),
             ("ARM Ltd", 0x961, _, 0x0000) => Some(PartInfo::new("CoreSight TMC", PeripheralType::Tmc)),
             ("ARM Ltd", 0x962, 0x00, 0x0000) => Some(PartInfo::new("CoreSight STM", PeripheralType::Stm)),
             ("ARM Ltd", 0x963, 0x63, 0x0a63) => Some(PartInfo::new("CoreSight STM", PeripheralType::Stm)),
@@ -869,6 +873,8 @@ pub enum PeripheralType {
     MemAp,
     /// Performance monitoring unit
     Pmu,
+    /// Program Trace Macrocell (ARMv7-A/R)
+    Ptm,
     /// Non-standard peripheral
     Custom,
 }
@@ -895,6 +901,7 @@ impl std::fmt::Display for PeripheralType {
             PeripheralType::Custom => write!(f, "(Non-standard peripheral)"),
             PeripheralType::MemAp => write!(f, "MEM-AP (Memory Access Port)"),
             PeripheralType::Pmu => write!(f, "PMU (Performance Monitoring Unit)"),
+            PeripheralType::Ptm => write!(f, "PTM (Program Trace Macrocell)"),
         }
     }
 }

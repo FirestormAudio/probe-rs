@@ -14,7 +14,7 @@ use crate::{
     MemoryInterface, MemoryMappedRegister,
     architecture::arm::{
         ArmDebugInterface, DapError, RegisterAddress,
-        core::registers::cortex_m::{PC, SP},
+        core::registers::cortex_m::{PC, SP, XPSR},
         dp::{Ctrl, DLPIDR, DebugPortError, DpRegister, TARGETID},
     },
     probe::WireProtocol,
@@ -25,7 +25,7 @@ use super::{
     ap::AccessPortError,
     armv6m::Demcr,
     communication_interface::DapProbe,
-    component::{TraceFunnel, TraceSink},
+    component::{TmcMode, TraceFunnel, TraceMemoryController, TraceSink},
     core::cortex_m::{Dhcsr, Vtor},
     dp::{Abort, DPIDR, DpAccess, DpAddress, SelectV1},
     memory::{
@@ -803,6 +803,30 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         }
     }
 
+    /// Called from `writeback_registers` immediately before `MOV PC, r0` when restoring register
+    /// state on an ARMv7-A/R core.
+    ///
+    /// At the point this hook is called:
+    /// - The core is halted in debug state.
+    /// - VBAR has already been set to `pc_value`.
+    /// - SCTLR.V (HIVEC) has already been cleared so that exceptions route through VBAR.
+    /// - DSB, ISB, ICIALLU, and BPIALL have already executed.
+    /// - `r0` may have been clobbered; the caller reloads `r0 = pc_value` after this hook returns.
+    ///
+    /// The default implementation is a no-op. Device-specific sequences that need extra
+    /// CPU-state teardown before restart (e.g. clearing stale MMU/cache/TE state or resetting
+    /// banked exception-mode registers) should override this.
+    ///
+    /// The hook may freely use `r0` as scratch; the generic code reloads `r0 = pc_value` afterward.
+    fn pre_run_writeback(
+        &self,
+        _interface: &mut dyn ArmMemoryInterface,
+        _debug_base: u64,
+        _pc_value: u32,
+    ) -> Result<(), ArmError> {
+        Ok(())
+    }
+
     /// Enable target trace capture.
     ///
     /// # Note
@@ -816,11 +840,26 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         &self,
         interface: &mut dyn ArmDebugInterface,
         components: &[CoresightComponent],
-        _sink: &TraceSink,
+        sink: &TraceSink,
     ) -> Result<(), ArmError> {
-        // As a default implementation, enable all of the slave port inputs of any trace funnels
-        // found. This should enable _all_ sinks simultaneously. Device-specific implementations
-        // can be written to properly configure the specified sink.
+        // For a TraceMemory sink, configure the ETF in software polling mode.
+        // Device-specific sequences (e.g. RZA1L) override this to set Circular or other modes.
+        // This must happen before setup_tracing() restarts capture.
+        if let TraceSink::TraceMemory(_) = sink {
+            for tmc_comp in components
+                .iter()
+                .filter_map(|c| c.find_component(PeripheralType::Tmc))
+            {
+                let mut tmc = TraceMemoryController::new(interface, tmc_comp);
+                tmc.disable_capture()
+                    .map_err(|e| ArmError::Other(format!("ETF disable_capture: {e}")))?;
+                tmc.set_mode(TmcMode::Software)
+                    .map_err(|e| ArmError::Other(format!("ETF set_mode: {e}")))?;
+            }
+        }
+
+        // Enable all of the slave port inputs of any trace funnels found.
+        // Device-specific implementations can restrict this to particular ports.
         for trace_funnel in components
             .iter()
             .filter_map(|comp| comp.find_component(PeripheralType::TraceFunnel))
@@ -1099,6 +1138,18 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         match core_type {
             CoreType::Armv7a | CoreType::Armv7r | CoreType::Armv8a => {
                 tracing::debug!("RAM flash start for Cortex-A/R core with ID {}", core_id);
+                // Set CPSR to SYS mode, ARM (not Thumb), all interrupt masks set.
+                // This is required when the target was halted while executing Thumb
+                // code: without this write, the ARM32 startup at vector_table_addr
+                // would be fetched and decoded as Thumb instructions and crash.
+                // CPSR value: Mode=SYS(0x1F), T=0 (ARM), A/I/F=1 (masked) → 0x1DF
+                const CPSR_SYS_ARM: u32 = 0x0000_01DF;
+                tracing::debug!(
+                    "prepare_running_on_ram: caching CPSR={:#010x} PC={:#010x}",
+                    CPSR_SYS_ARM,
+                    vector_table_addr
+                );
+                core.write_core_reg(XPSR.id, CPSR_SYS_ARM)?;
                 core.write_core_reg(PC.id, vector_table_addr)?;
             }
             CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {

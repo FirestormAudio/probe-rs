@@ -13,9 +13,14 @@ use crate::{
 
 const REGISTER_OFFSET_RSZ: u32 = 0x04;
 const REGISTER_OFFSET_RRD: u32 = 0x10;
+const REGISTER_OFFSET_RRP: u32 = 0x14;
+const REGISTER_OFFSET_RWP: u32 = 0x18;
 const REGISTER_OFFSET_CTL: u32 = 0x20;
 const REGISTER_OFFSET_CBUFLVL: u32 = 0x30;
+const REGISTER_OFFSET_RRPHI: u32 = 0x38;
+const REGISTER_OFFSET_RWPHI: u32 = 0x3C;
 
+/// Selects the operating mode of the Trace Memory Controller.
 #[repr(u8)]
 pub enum Mode {
     /// Trace memory is used as a circular buffer. When the buffer fills, incoming trace data will
@@ -89,6 +94,20 @@ impl<'a> TraceMemoryController<'a> {
         }
     }
 
+    /// Read the current RAM read pointer.
+    pub fn read_pointer(&mut self) -> Result<u64, ArmError> {
+        let low = self.component.read_reg(self.interface, REGISTER_OFFSET_RRP)? as u64;
+        let high = self.component.read_reg(self.interface, REGISTER_OFFSET_RRPHI)? as u64;
+        Ok((high << 32) | low)
+    }
+
+    /// Read the current RAM write pointer.
+    pub fn write_pointer(&mut self) -> Result<u64, ArmError> {
+        let low = self.component.read_reg(self.interface, REGISTER_OFFSET_RWP)? as u64;
+        let high = self.component.read_reg(self.interface, REGISTER_OFFSET_RWPHI)? as u64;
+        Ok((high << 32) | low)
+    }
+
     /// Check if the FIFO is full.
     pub fn full(&mut self) -> Result<bool, Error> {
         let status = Status::load(self.component, self.interface)?;
@@ -135,6 +154,14 @@ impl<'a> TraceMemoryController<'a> {
     pub fn stop_on_flush(&mut self, stop: bool) -> Result<(), Error> {
         let mut ffcr = FormatFlushControl::load(self.component, self.interface)?;
         ffcr.set_stoponfl(stop);
+        ffcr.store(self.component, self.interface)?;
+        Ok(())
+    }
+
+    /// Enable formatter output so ETF reads contain CoreSight framed data.
+    pub fn enable_formatter(&mut self) -> Result<(), Error> {
+        let mut ffcr = FormatFlushControl::load(self.component, self.interface)?;
+        ffcr.set_enft(true);
         ffcr.store(self.component, self.interface)?;
         Ok(())
     }
