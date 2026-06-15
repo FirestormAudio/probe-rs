@@ -808,16 +808,14 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     ///
     /// At the point this hook is called:
     /// - The core is halted in debug state.
-    /// - VBAR has already been set to `pc_value`.
-    /// - SCTLR.V (HIVEC) has already been cleared so that exceptions route through VBAR.
-    /// - DSB, ISB, ICIALLU, and BPIALL have already executed.
-    /// - `r0` may have been clobbered; the caller reloads `r0 = pc_value` after this hook returns.
+    /// - `r0` already holds `pc_value` and may be freely used as scratch; the caller reloads
+    ///   `r0 = pc_value` after this hook returns and then executes `MOV PC, r0`.
     ///
-    /// The default implementation is a no-op. Device-specific sequences that need extra
-    /// CPU-state teardown before restart (e.g. clearing stale MMU/cache/TE state or resetting
-    /// banked exception-mode registers) should override this.
-    ///
-    /// The hook may freely use `r0` as scratch; the generic code reloads `r0 = pc_value` afterward.
+    /// The default implementation is a no-op, so generic ARMv7-A/R targets are not mutated on
+    /// resume. Device-specific sequences that need extra CPU-state teardown before restart
+    /// (e.g. clearing stale SCTLR.V/MMU/cache/TE state, invalidating caches, or resetting
+    /// banked exception-mode registers) should override this and perform any required barriers
+    /// themselves.
     fn pre_run_writeback(
         &self,
         _interface: &mut dyn ArmMemoryInterface,

@@ -335,42 +335,20 @@ impl<'probe> Armv7ar<'probe> {
                     15 => {
                         let pc_val: u32 = val.try_into()?;
 
+                        // r0 is used as scratch below (and may be clobbered by the
+                        // device-specific hook). Make sure its halt-time value is cached so
+                        // the r0..r14 loop after this case restores it before restart.
+                        self.prepare_r0_for_clobber()?;
+
                         // Load pc_val into r0 via DTRRX.
                         let load_r0 = build_mrc(14, 0, 0, 0, 5, 0);
                         self.execute_instruction_with_input(load_r0, pc_val)?;
 
-                        // Clear SCTLR.V (bit 13, HIVEC) so that exceptions use VBAR rather
-                        // than the legacy high-vector page at 0xFFFF0000.
-                        // MRC p15, 0, r0, c1, c0, 0  (read SCTLR → r0)
-                        let read_sctlr = build_mrc(15, 0, 0, 1, 0, 0);
-                        self.execute_instruction(read_sctlr)?;
-                        // BIC r0, r0, #0x2000  (clear bit 13 = HIVEC)
-                        // imm12 = {rot=10, imm8=0x02} → 0x02 ROR 20 = 0x00002000
-                        self.execute_instruction(0xE3C0_0A02)?;
-                        // MCR p15, 0, r0, c1, c0, 0  (write SCTLR ← r0)
-                        let write_sctlr = build_mcr(15, 0, 0, 1, 0, 0);
-                        self.execute_instruction(write_sctlr)?;
-
-                        // ARMv7-A CP15 barriers (cond=AL, safe via DBGITR).
-                        // The newer 0xF57FF04F/06F encodings use cond=0b1111 and are
-                        // CONSTRAINED UNPREDICTABLE via DBGITR (ARM TRM §12.3).
-                        // MCR p15, 0, r0, c7, c10, 4  (DSB)
-                        let dsb_mcr = build_mcr(15, 0, 0, 7, 10, 4);
-                        self.execute_instruction(dsb_mcr)?;
-                        // MCR p15, 0, r0, c7, c5, 4  (ISB)
-                        let isb_mcr = build_mcr(15, 0, 0, 7, 5, 4);
-                        self.execute_instruction(isb_mcr)?;
-                        // Invalidate I-cache (ICIALLU) and branch predictor (BPIALL).
-                        // MCR p15, 0, r0, c7, c5, 0  (ICIALLU)
-                        let iciallu = build_mcr(15, 0, 0, 7, 5, 0);
-                        self.execute_instruction(iciallu)?;
-                        // MCR p15, 0, r0, c7, c5, 6  (BPIALL)
-                        let bpiall = build_mcr(15, 0, 0, 7, 5, 6);
-                        self.execute_instruction(bpiall)?;
-
-                        // Give the device-specific sequence a chance to clear any additional
-                        // stale CPU state (e.g. MMU, other SCTLR bits, banked registers) before
-                        // the CPU is released. The hook may freely use r0 as scratch.
+                        // Give the device-specific sequence a chance to clear stale CPU state
+                        // (e.g. SCTLR.V/MMU/cache bits, banked registers) before the CPU is
+                        // released. The default is a no-op so that generic ARMv7-A/R targets are
+                        // not mutated on resume; targets that need such teardown (e.g. RZ/A1L)
+                        // override `pre_run_writeback`. The hook may freely use r0 as scratch.
                         self.sequence.pre_run_writeback(
                             self.memory.as_mut(),
                             self.base_address,
@@ -386,35 +364,28 @@ impl<'probe> Armv7ar<'probe> {
                         let instruction = build_mov(15, 0);
                         self.execute_instruction(instruction)?;
 
-                        // The CPU has restarted; clear the register cache immediately so
-                        // the loop over r0..r14 below finds nothing dirty and does not
-                        // attempt further DBGITR writes to a running core.
-                        self.reset_register_cache();
-                        return Ok(());
+                        // Do NOT restart or clear the cache here: `mov pc, r0` only sets the
+                        // restart address; the core stays in Debug state until DBGDRCR.RRQ
+                        // (ARM DDI0406 §"Exiting Debug state"). Fall through so r0..r14 are
+                        // still restored below — loading them via MRC/DTRRX touches neither PC
+                        // nor CPSR, so the restart address set above is preserved.
                     }
                     16 => {
                         let cpsr_val: u32 = val.try_into()?;
-                        // CPSR.T (bit 5) indicates Thumb state at halt; DBGITR then decodes
-                        // instructions as Thumb-2. MSR uses the Thumb-2 encoding accordingly;
-                        // after the write the CPU's ISA reverts to ARM for the rest of writeback.
-                        // MRC/MCR p14/p15 coprocessor instructions are identical in both ISAs.
-                        let was_thumb = (cpsr_val >> 5) & 1 == 1;
+                        // Instructions issued through the DBGITR are always interpreted as ARM
+                        // opcodes, regardless of the halted core's CPSR.{J,T} (ARM DDI0406
+                        // §"Executing instructions in Debug state"). So `MSR CPSR_fsxc, r0`
+                        // must use the ARM encoding even when the core halted in Thumb state —
+                        // a Thumb encoding here would be decoded as a (wrong) ARM instruction.
                         self.prepare_r0_for_clobber()?;
                         let load_r0 = build_mrc(14, 0, 0, 0, 5, 0);
                         self.execute_instruction_with_input(load_r0, cpsr_val)?;
-                        if was_thumb {
-                            // Thumb-2 encoding of `MSR CPSR_fsxc, r0`.
-                            // Verified with arm-none-eabi-as: `msr cpsr_fsxc, r0` → F380 8F00
-                            // DBGITR for T2: MSB halfword in [31:16], LSB halfword in [15:0].
-                            self.execute_instruction(0xF380_8F00)?;
-                        } else {
-                            let msr_cpsr = build_msr(0);
-                            self.execute_instruction(msr_cpsr)?;
-                        }
+                        let msr_cpsr = build_msr(0);
+                        self.execute_instruction(msr_cpsr)?;
                         // ISB required before restart when CPSR was changed (ARM DDI0406
                         // §B1.8.2: context-changing operations require ISB before exit from
-                        // debug state). When PC is also dirty, case 15 handles this and returns
-                        // early — the flag is only checked on the CPSR-only exit path below.
+                        // debug state). The trailing `if needs_isb` block emits it after all
+                        // register writeback completes.
                         needs_isb = true;
                     }
                     17..=48 => {

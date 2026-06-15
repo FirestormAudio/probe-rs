@@ -15,21 +15,13 @@ use crate::{
 };
 
 // ── External debug register offsets (from PMU component base address) ────────
-// IHI0029D Table 10-2 / DDI0388I §11.3
-const PMEVCNTR_BASE: u32 = 0x000; // PMEVCNTRn = base + 4*n   (n = 0..5)
-const PMCCNTR: u32 = 0x07C; // Cycle counter (32-bit)
-const PMEVTYPER_BASE: u32 = 0x400; // PMEVTYPERn = base + 4*n  (n = 0..5)
+// Cortex-A9 PMU memory-mapped (APB, PADDRDBG[12]=1) register offsets, DDI0388-i Table 11.1.
+const PMEVCNTR_BASE: u32 = 0x000; // PMXEVCNTRn = base + 4*n   (n = 0..5)
+const PMCCNTR: u32 = 0x07C; // Cycle counter, register #31 (32-bit)
+const PMEVTYPER_BASE: u32 = 0x400; // PMXEVTYPERn = base + 4*n  (n = 0..5)
 const PMCNTENSET: u32 = 0xC00; // Counter enable set
 const PMCNTENCLR: u32 = 0xC20; // Counter enable clear
 const PMOVSR: u32 = 0xC80; // Overflow flag status (write 1 to clear)
-#[allow(dead_code)]
-const PMSELR: u32 = 0xD00; // Event counter selection (reserved for future use)
-#[allow(dead_code)]
-const PMXEVTYPER: u32 = 0xDA0; // Event type for selected counter (reserved for future use)
-#[allow(dead_code)]
-const PMXEVCNTR: u32 = 0xDC0; // Event count for selected counter (reserved for future use)
-#[allow(dead_code)]
-const PMUSERENR: u32 = 0xE00; // User-mode enable (EL0) (reserved for future use)
 const PMCR: u32 = 0xE04; // PMU control register
 
 // ── PMCR bit fields ───────────────────────────────────────────────────────────
@@ -48,6 +40,13 @@ const PMCNTEN_CCNTR: u32 = 1 << 31;
 ///
 /// Values are the 8-bit event identifiers written into PMEVTYPERn
 /// (ARM DDI 0388I Table 11-23).
+/// Only events the Cortex-A9 actually implements are exposed.
+///
+/// The A9 implements architectural events `0x00`–`0x12` (DDI0388-i Table 11.5) — but with two
+/// gaps: `0x08` (INST_RETIRED) and `0x0E` (BR_RETURN_RETIRED) are **not** implemented; the A9
+/// provides equivalents at `0x68` and `0x6E`. The generic ARMv7 "common" events `0x13`–`0x1E`
+/// are not implemented on the A9 (it would silently count nothing); the useful microarchitectural
+/// counters live in the A9-specific `0x40`–`0x6B` range instead (DDI0388-i Table 11.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PmuEvent {
@@ -67,8 +66,6 @@ pub enum PmuEvent {
     DataRead = 0x06,
     /// Data writes (including SWP, STM, etc.).
     DataWrite = 0x07,
-    /// Instruction executed.
-    InstructionExecuted = 0x08,
     /// Exception taken.
     ExceptionTaken = 0x09,
     /// Exception return executed.
@@ -79,8 +76,6 @@ pub enum PmuEvent {
     SWChangePC = 0x0C,
     /// Immediate branch that is architecturally executed.
     ImmBranchExecuted = 0x0D,
-    /// Procedure call executed.
-    ProcedureCall = 0x0E,
     /// Unaligned load or store executed.
     UnalignedAccess = 0x0F,
     /// Branch mispredicted or not predicted.
@@ -89,28 +84,31 @@ pub enum PmuEvent {
     CycleCountAlias = 0x11,
     /// Predictable branches speculatively executed.
     BranchPredicted = 0x12,
-    /// Data memory access.
-    DataMemoryAccess = 0x13,
-    /// L1 instruction cache access.
-    L1ICacheAccess = 0x14,
-    /// L1 data cache write-back.
-    L1DCacheWriteback = 0x15,
-    /// L2 data cache access.
-    L2DCacheAccess = 0x16,
-    /// L2 data cache refill.
-    L2DCacheRefill = 0x17,
-    /// L2 data cache write-back.
-    L2DCacheWriteback = 0x18,
-    /// Bus access.
-    BusAccess = 0x19,
-    /// Memory error (parity/ECC).
-    MemoryError = 0x1A,
-    /// Instruction speculatively executed.
-    InstructionSpeculative = 0x1B,
-    /// Bus cycle.
-    BusCycle = 0x1D,
-    /// Chain: even and odd event counter chained.
-    Chain = 0x1E,
+
+    // ── Cortex-A9-specific events (DDI0388-i Table 11.6) ────────────────────────
+    /// Approximate instructions executed: count of instructions leaving the register
+    /// rename stage (A9 has no architectural `0x08`/INST_RETIRED counter).
+    InstructionExecuted = 0x68,
+    /// Predictable function returns (A9 equivalent of `0x0E`/BR_RETURN_RETIRED).
+    ProcedureCall = 0x6E,
+    /// Coherent linefill that missed in all other cores (fetched from external memory).
+    CoherentLinefillMiss = 0x50,
+    /// Coherent linefill that hit in another core's cache.
+    CoherentLinefillHit = 0x51,
+    /// Instruction-cache dependent stall cycles.
+    ICacheStall = 0x60,
+    /// Data-cache dependent stall cycles.
+    DCacheStall = 0x61,
+    /// Main TLB miss stall cycles.
+    MainTlbStall = 0x62,
+    /// STREX instructions that passed.
+    StrexPassed = 0x63,
+    /// STREX instructions that failed.
+    StrexFailed = 0x64,
+    /// Data evictions caused by a linefill (closest A9 analogue of an L1D write-back).
+    DataEviction = 0x65,
+    /// Data linefills performed on the external AXI bus.
+    DataLinefill = 0x69,
 }
 
 impl std::fmt::Display for PmuEvent {
@@ -124,28 +122,26 @@ impl std::fmt::Display for PmuEvent {
             Self::DtlbRefill => "L1D_TLB_REFILL",
             Self::DataRead => "LD_RETIRED",
             Self::DataWrite => "ST_RETIRED",
-            Self::InstructionExecuted => "INST_RETIRED",
             Self::ExceptionTaken => "EXC_TAKEN",
             Self::ExceptionReturn => "EXC_RETURN",
             Self::ContextIdRetired => "CID_WRITE_RETIRED",
             Self::SWChangePC => "PC_WRITE_RETIRED",
             Self::ImmBranchExecuted => "BR_IMMED_RETIRED",
-            Self::ProcedureCall => "BR_RETURN_RETIRED",
             Self::UnalignedAccess => "UNALIGNED_LDST_RETIRED",
             Self::BranchMispredict => "BR_MIS_PRED",
             Self::CycleCountAlias => "CPU_CYCLES",
             Self::BranchPredicted => "BR_PRED",
-            Self::DataMemoryAccess => "MEM_ACCESS",
-            Self::L1ICacheAccess => "L1I_CACHE",
-            Self::L1DCacheWriteback => "L1D_CACHE_WB",
-            Self::L2DCacheAccess => "L2D_CACHE",
-            Self::L2DCacheRefill => "L2D_CACHE_REFILL",
-            Self::L2DCacheWriteback => "L2D_CACHE_WB",
-            Self::BusAccess => "BUS_ACCESS",
-            Self::MemoryError => "MEMORY_ERROR",
-            Self::InstructionSpeculative => "INST_SPEC",
-            Self::BusCycle => "BUS_CYCLES",
-            Self::Chain => "CHAIN",
+            Self::InstructionExecuted => "INST_RETIRED_APPROX",
+            Self::ProcedureCall => "BR_RETURN_RETIRED",
+            Self::CoherentLinefillMiss => "COHERENT_LINEFILL_MISS",
+            Self::CoherentLinefillHit => "COHERENT_LINEFILL_HIT",
+            Self::ICacheStall => "ICACHE_STALL",
+            Self::DCacheStall => "DCACHE_STALL",
+            Self::MainTlbStall => "MAIN_TLB_STALL",
+            Self::StrexPassed => "STREX_PASSED",
+            Self::StrexFailed => "STREX_FAILED",
+            Self::DataEviction => "DATA_EVICTION",
+            Self::DataLinefill => "DATA_LINEFILL",
         };
         write!(f, "{s}")
     }

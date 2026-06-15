@@ -863,7 +863,7 @@ impl Cmd {
             );
 
             // Optionally decode and/or show the execution flow.
-            if self.decode || self.flow || self.full_flow || self.profile {
+            if self.decode || self.flow || self.full_flow || self.profile || self.samply_output.is_some() {
                 // Collect into a Vec so all display modes share the same packets.
                 let packets: Vec<ptm_decoder::PtmPacket> =
                     ptm_decoder::Decoder::new(&ptm_bytes, self.context_id_bytes).collect();

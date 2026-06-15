@@ -149,14 +149,30 @@ impl fmt::Display for PtmPacket {
 // Decoder
 //─────────────────────────────────────────────────────────────────────────────
 
+/// Instruction-set state, tracked across packets so partial branch addresses can be
+/// scaled correctly. The scaling factor for the transmitted address bits depends on the
+/// current ISA: ARM addresses are word-aligned (×4) and Thumb addresses halfword-aligned
+/// (×2). See ptm2human `tracer-ptm.c` and `ptm.c`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Isa {
+    #[default]
+    Arm,
+    Thumb,
+    Jazelle,
+}
+
 /// Decoder state tracked across packets for reconstructing branch addresses.
 ///
 /// PTM branch address packets use the previous "address" as a base for
 /// continuation bytes — only the changed high bits are transmitted.
 #[derive(Debug, Clone, Default)]
 struct DecoderState {
-    /// Last known program counter (updated by I-Sync and fully-qualified branches).
+    /// Last known program counter, byte-aligned (no Thumb bit). Updated by I-Sync and
+    /// branch packets.
     last_pc: u32,
+    /// Current instruction-set state, used to scale partial branch addresses. Updated by
+    /// I-Sync and full (5-byte) branch packets.
+    isa: Isa,
     /// Number of context ID bytes expected per packet (0–4), from ETMCR.
     context_id_bytes: u8,
 }
@@ -164,94 +180,99 @@ struct DecoderState {
 impl DecoderState {
     /// Reconstruct a branch target from a sequence of address continuation bytes.
     ///
-    /// ETMv3/PTM branch address encoding (ARM DDI 0314H §4.3, IHI0035B §4.3.3):
+    /// ETMv3/PTM branch address encoding (ARM DDI 0314H §4.3, IHI0035B §4.3.3), matching
+    /// the reference decoder ptm2human (`ptm.c` / `tracer-ptm.c`):
     ///
     /// ```text
-    /// Byte 0      (header):   bit[0]=1 (branch marker), bit[7]=S, bits[6:1] = A[6:1]
-    /// Bytes 1..N-2 (middle):  bit[7]=S, bits[6:0] = next 7 address bits
+    /// Byte 0      (header):   bit[0]=1 (branch marker), bit[7]=S, bits[6:1] = 6 raw bits
+    /// Bytes 1..N-2 (middle):  bit[7]=S, bits[6:0] = next 7 raw bits
     /// Byte N-1    (final, partial packet N<5):
     ///                         bit[7]=0, bit[6]=E (exception info follows),
     ///                         bit[5]=altISA (alternate-ISA byte follows),
-    ///                         bits[4:0] = next 5 address bits
+    ///                         bits[4:0] = next 5 raw bits
     /// Byte 4      (final, full 5-byte packet):
-    ///                         bit[7]=0, bit[6]=E, bits[5:4/5:3/5:0] = ISA state
+    ///                         bit[7]=0, bit[6]=E, bit[5]=Jazelle, bit[4]=Thumb,
+    ///                         remaining low bits = upper address bits
     /// ```
     ///
-    /// Address bit counts per packet length:
-    /// - 1-byte: 6 bits (A[6:1])
-    /// - 2-byte: 6 + 5 = 11 bits (A[11:1])
-    /// - 3-byte: 6 + 7 + 5 = 18 bits (A[18:1])
-    /// - 4-byte: 6 + 7 + 7 + 5 = 25 bits (A[25:1])
-    /// - 5-byte: 32-bit absolute address
+    /// The transmitted bits are *raw* (instruction-count) units; the final byte address is
+    /// obtained by scaling by the ISA: ARM ×4, Thumb ×2, Jazelle ×1. For partial packets
+    /// only the low (scaled-bit-count) bits of the previous address are replaced.
     ///
-    /// Returns `(address, is_exception, has_alt_isa, is_link)`.
-    /// The caller must consume the altISA byte (if any) and exception-info bytes (if any)
-    /// before continuing to decode the next packet.
+    /// Returns `(address, is_exception, has_alt_isa, is_link)`. The returned address has its
+    /// bit[0] set when the resulting ISA is Thumb (matching the I-Sync `pc` convention). The
+    /// caller must consume the altISA byte (if any) and exception-info bytes (if any) before
+    /// continuing to decode the next packet.
     fn reconstruct_branch(&mut self, bytes: &[u8]) -> (u32, bool, bool, bool) {
         debug_assert!(!bytes.is_empty());
 
-        // Byte 0: bits[6:1] → addr[5:0]  (6 bits representing A[6:1], with A[0] implicit)
+        // Byte 0 carries 6 raw address bits in bits[6:1].
         let mut addr: u32 = ((bytes[0] & 0x7E) >> 1) as u32;
         let mut is_exception = false;
         let mut has_alt_isa = false;
         let is_link = false;
 
-        if bytes.len() == 5 {
-            // Full 5-byte packet: bytes 1-3 are plain 7-bit address chunks;
-            // byte 4 carries ISA state and exception flag.
+        let reconstructed = if bytes.len() == 5 {
+            // Full 5-byte packet: bytes 1-3 are plain 7-bit chunks; byte 4 carries the ISA
+            // state, the exception flag, and the top address bits, then the whole value is
+            // scaled by the ISA (ptm2human ptm.c:216-234).
             for (idx, &b) in bytes[1..4].iter().enumerate() {
                 addr |= ((b & 0x7F) as u32) << (6 + 7 * idx);
             }
             let b4 = bytes[4];
-            if b4 & 0x20 != 0 {
-                // Jazelle state — bits[4:0] of byte 4 are upper address bits
-                addr |= ((b4 & 0x1F) as u32) << 27;
-            } else if b4 & 0x10 != 0 {
-                // Thumb state
-                addr |= ((b4 & 0x0F) as u32) << 27;
-            } else {
-                // ARM state
-                addr |= ((b4 & 0x07) as u32) << 27;
-            }
             is_exception = b4 & 0x40 != 0;
-        } else if bytes.len() > 1 {
-            // Partial packet (2–4 bytes):
-            // Intermediate bytes (bytes[1..len-2]) carry 7 plain address bits each.
-            // Final byte (bytes[len-1]) carries only 5 address bits (bits[4:0]);
-            //   bit[6] = E (exception info follows), bit[5] = altISA byte follows.
-            let last = bytes.len() - 1;
-            for (idx, &b) in bytes[1..last].iter().enumerate() {
-                addr |= ((b & 0x7F) as u32) << (6 + 7 * idx);
+            if b4 & 0x20 != 0 {
+                // Jazelle: 5 top bits, no scaling.
+                addr |= ((b4 & 0x1F) as u32) << 27;
+                self.isa = Isa::Jazelle;
+            } else if b4 & 0x10 != 0 {
+                // Thumb: 4 top bits, halfword-aligned (×2).
+                addr |= ((b4 & 0x0F) as u32) << 27;
+                addr <<= 1;
+                self.isa = Isa::Thumb;
+            } else {
+                // ARM: 3 top bits, word-aligned (×4).
+                addr |= ((b4 & 0x07) as u32) << 27;
+                addr <<= 2;
+                self.isa = Isa::Arm;
             }
-            let final_b = bytes[last];
-            let intermediate_count = (last - 1) as u32; // number of 7-bit middle bytes
-            let final_bit_offset = 6 + 7 * intermediate_count;
-            addr |= ((final_b & 0x1F) as u32) << final_bit_offset;
-            is_exception = (final_b & 0x40) != 0;
-            has_alt_isa   = (final_b & 0x20) != 0;
-        }
-        // 1-byte packet: no extra bytes — addr already has the 6-bit partial address,
-        // no exception/altISA flag bits available.
-
-        let reconstructed = if bytes.len() == 5 {
-            addr | (self.last_pc & 1) // preserve Thumb bit from last_pc for full packets
+            addr
         } else {
-            // Partial address: reconstruct by patching only the known bits into last_pc.
-            // `addr` holds A[nbits:1] in addr[nbits-1:0] (1-byte case: 6 bits,
-            //  partial cases: 11/18/25 bits depending on length).
-            let addr_bits: u32 = match bytes.len() {
-                1 => 6,
-                2 => 11,
-                3 => 18,
-                4 => 25,
-                _ => unreachable!(),
+            // Partial packet (1–4 bytes): accumulate the raw bits, then scale by the current
+            // ISA and patch the low scaled bits into the previous address
+            // (ptm2human tracer-ptm.c:73-83). The ISA is unchanged by partial packets.
+            let mut raw_bits: u32 = 6;
+            if bytes.len() > 1 {
+                let last = bytes.len() - 1;
+                for (idx, &b) in bytes[1..last].iter().enumerate() {
+                    addr |= ((b & 0x7F) as u32) << (6 + 7 * idx);
+                    raw_bits += 7;
+                }
+                let final_b = bytes[last];
+                let final_bit_offset = 6 + 7 * (last as u32 - 1);
+                addr |= ((final_b & 0x1F) as u32) << final_bit_offset;
+                raw_bits += 5;
+                is_exception = (final_b & 0x40) != 0;
+                has_alt_isa = (final_b & 0x20) != 0;
+            }
+
+            let (scaled, scaled_bits) = match self.isa {
+                Isa::Arm => (addr << 2, raw_bits + 2),
+                Isa::Thumb => (addr << 1, raw_bits + 1),
+                Isa::Jazelle => (addr, raw_bits),
             };
-            let mask = ((1u32 << addr_bits).wrapping_sub(1)) << 1;
-            (self.last_pc & !mask) | ((addr << 1) & mask)
+            let mask = ((1u64 << scaled_bits) - 1) as u32;
+            (self.last_pc & !mask) | (scaled & mask)
         };
 
-        self.last_pc = reconstructed & !1; // strip Thumb bit for state tracking
-        (reconstructed, is_exception, has_alt_isa, is_link)
+        // last_pc is kept byte-aligned (no Thumb bit) for the next partial merge.
+        self.last_pc = reconstructed;
+        let out = if self.isa == Isa::Thumb {
+            reconstructed | 1
+        } else {
+            reconstructed
+        };
+        (out, is_exception, has_alt_isa, is_link)
     }
 }
 
@@ -284,6 +305,7 @@ impl<'a> Decoder<'a> {
             pos: 0,
             state: DecoderState {
                 last_pc: 0,
+                isa: Isa::default(),
                 context_id_bytes,
             },
             synced: false,
@@ -335,10 +357,10 @@ impl<'a> Decoder<'a> {
         false
     }
 
-    /// Parse an I-Sync packet body (IHI0035B §5.6.2).
+    /// Parse an I-Sync packet body.
     ///
-    /// Layout after the `0x04` header:
-    ///   [context_id_bytes bytes] [1 byte cpsr_low8] [1..5 address bytes]
+    /// Field order after the `0x08` header (verified against ptm2human `ptm.c`):
+    ///   [4 bytes address LE] [1 byte info] [cycle count if cycle-accurate] [0–4 ctx-ID bytes]
     fn parse_isync(&mut self) -> Option<PtmPacket> {
         // IHI0035B §4.2 I-sync packet order (matches ptm2human isync decoder):
         //   1 byte  : header (already consumed by caller)
@@ -365,6 +387,9 @@ impl<'a> Decoder<'a> {
         }
 
         self.state.last_pc = pc & !1;
+        // The I-Sync address LSB carries the Thumb (T) bit; use it to seed the ISA state so
+        // subsequent partial branch addresses are scaled correctly.
+        self.state.isa = if pc & 1 != 0 { Isa::Thumb } else { Isa::Arm };
 
         Some(PtmPacket::ISync {
             pc,
@@ -773,19 +798,53 @@ mod tests {
 
     // ── Branch address ───────────────────────────────────────────────────────
 
-    /// 2-byte branch with no exception: [0x81, 0x01] → address 0x80.
+    /// 2-byte branch with no exception, default (ARM) ISA: [0x81, 0x01] → address 0x100.
     ///
-    /// byte[0]=0x81: bit[7]=1 (continuation), addr = (0x81 & 0x7E)>>1 = 0.
+    /// byte[0]=0x81: bit[7]=1 (continuation), 6 raw bits = (0x81 & 0x7E)>>1 = 0.
     /// byte[1]=0x01: bit[7]=0 (final), bit[6]=0 (no exception), bits[4:0]=0x01.
-    ///   addr |= (0x01 & 0x1F) << 6 = 0x40.
-    ///   addr_bits=11, mask=0x0FFE → address = (0 & ~0x0FFE) | (0x40<<1 & 0x0FFE) = 0x80.
+    ///   raw |= (0x01 & 0x1F) << 6 = 0x40  → raw = 0x40 (11 raw bits).
+    ///   ARM scaling ×4: scaled = 0x100 (13 bits), merged into last_pc(0) → 0x100.
     #[test]
     fn decode_branch_two_bytes() {
         let mut data = async_seq();
         data.extend([0x81, 0x01]);
         let pkts = decode_all(&data, 0);
         assert!(
-            matches!(pkts[1], PtmPacket::Branch { address: 0x80, is_exception: false, .. }),
+            matches!(pkts[1], PtmPacket::Branch { address: 0x100, is_exception: false, .. }),
+            "got {:?}",
+            pkts[1]
+        );
+    }
+
+    /// Same packet bytes but in Thumb ISA (set via a preceding I-Sync with an odd PC):
+    /// the raw value is scaled ×2 instead of ×4, and the address carries the Thumb bit.
+    /// raw = 0x40 → Thumb scaled = 0x80; address = 0x80 | 1 = 0x81.
+    #[test]
+    fn decode_branch_two_bytes_thumb_isa() {
+        let mut data = async_seq();
+        // I-Sync with PC = 0x1 (odd → Thumb), info byte 0x00.
+        data.extend([0x08, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        data.extend([0x81, 0x01]);
+        let pkts = decode_all(&data, 0);
+        assert!(
+            matches!(pkts[2], PtmPacket::Branch { address: 0x81, is_exception: false, .. }),
+            "got {:?}",
+            pkts[2]
+        );
+    }
+
+    /// Full 5-byte branch packet in ARM state encodes a 32-bit absolute address.
+    /// Bytes after the 0x?1 header carry 6 + 7 + 7 + 7 + 3 = 30 raw bits, then ×4 → 32-bit.
+    /// Here all address bits are 0 except byte[4] bit0 → raw bit 27 set → (1<<27)<<2 = 1<<29.
+    #[test]
+    fn decode_branch_five_bytes_arm_full() {
+        let mut data = async_seq();
+        // header (cont), three 0x80 continuation bytes (cont, zero bits), final byte 0x01:
+        // bit6=0 (no exc), bit5=0 (ARM), low ARM bits = 0b001 → raw bit 27.
+        data.extend([0x81, 0x80, 0x80, 0x80, 0x01]);
+        let pkts = decode_all(&data, 0);
+        assert!(
+            matches!(pkts[1], PtmPacket::Branch { address: 0x2000_0000, is_exception: false, .. }),
             "got {:?}",
             pkts[1]
         );
@@ -794,10 +853,10 @@ mod tests {
     /// 2-byte branch with exception bit set: exception-info byte must be consumed
     /// and the next valid packet must decode without producing UNKNOWN.
     ///
-    /// byte[0]=0xfd: continuation, addr = (0xfd & 0x7E)>>1 = 0x3E.
+    /// byte[0]=0xfd: continuation, 6 raw bits = (0xfd & 0x7E)>>1 = 0x3E.
     /// byte[1]=0x43: final, bit[6]=1 (exception!), bits[4:0]=0x03.
-    ///   addr |= 0x03 << 6 = 0xC0 → addr=0xFE.
-    ///   address = 0 | (0xFE<<1 & 0xFFE) = 0x1FC.
+    ///   raw |= 0x03 << 6 = 0xC0 → raw = 0xFE (11 raw bits).
+    ///   ARM scaling ×4: address = 0xFE << 2 = 0x3F8.
     /// byte 0x1c: exception-info byte, S=0 → consumed, no Unknown emitted.
     /// byte 0x0C: Trigger → decoded correctly.
     #[test]
@@ -807,8 +866,8 @@ mod tests {
         let pkts = decode_all(&data, 0);
         assert_eq!(pkts.len(), 3, "expected Sync + Branch + Trigger, got {pkts:?}");
         assert!(
-            matches!(pkts[1], PtmPacket::Branch { address: 0x1fc, is_exception: true, .. }),
-            "expected exception branch at 0x1fc, got {:?}", pkts[1]
+            matches!(pkts[1], PtmPacket::Branch { address: 0x3f8, is_exception: true, .. }),
+            "expected exception branch at 0x3f8, got {:?}", pkts[1]
         );
         assert_eq!(pkts[2], PtmPacket::Trigger, "got {:?}", pkts[2]);
     }

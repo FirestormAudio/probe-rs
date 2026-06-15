@@ -762,6 +762,10 @@ impl PeripheralID {
             // PART 0x950 = PTM-A5/A8/A9/A15, 0x95A = PTM-A9r3 (used in RZ/A1L)
             ("ARM Ltd", 0x950, 0x13, 0x0000) => Some(PartInfo::new("Cortex-A PTM", PeripheralType::Ptm)),
             ("ARM Ltd", 0x95A, 0x13, 0x0000) => Some(PartInfo::new("Cortex-A9 PTM", PeripheralType::Ptm)),
+            // Cortex-A9 PMU: PART 0x9A0, DEVTYPE 0x16 (perf-monitor), no CoreSight arch_id.
+            // It predates the CoreSight v3 PMU architecture id (0x0A06) matched below, so it
+            // must be recognised by part number (observed on RZ/A1L at debug_base + 0x1000).
+            ("ARM Ltd", 0x9A0, 0x16, 0x0000) => Some(PartInfo::new("Cortex-A9 PMU", PeripheralType::Pmu)),
             ("ARM Ltd", 0x961, _, 0x0000) => Some(PartInfo::new("CoreSight TMC", PeripheralType::Tmc)),
             ("ARM Ltd", 0x962, 0x00, 0x0000) => Some(PartInfo::new("CoreSight STM", PeripheralType::Stm)),
             ("ARM Ltd", 0x963, 0x63, 0x0a63) => Some(PartInfo::new("CoreSight STM", PeripheralType::Stm)),

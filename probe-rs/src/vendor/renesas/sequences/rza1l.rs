@@ -363,6 +363,10 @@ impl ArmDebugSequence for RZA1L {
         // BIC r0, r0, #0x800   (Z / branch predictor, bit 11)
         // imm12 = {rot=0xC, imm8=0x08} → 0x08 ROR 24 = 0x800
         execute_instruction(interface, debug_base, 0xE3C0_0C08)?;
+        // BIC r0, r0, #0x2000  (V / HIVEC, bit 13) — route exceptions through VBAR rather
+        // than the legacy high-vector page at 0xFFFF0000.
+        // imm12 = {rot=0xA, imm8=0x02} → 0x02 ROR 20 = 0x2000
+        execute_instruction(interface, debug_base, 0xE3C0_0A02)?;
         // BIC r0, r0, #0x5     (D-cache bit 2, MMU bit 0)
         execute_instruction(interface, debug_base, 0xE3C0_0005)?;
         // BIC r0, r0, #0x40000000  (TE = Thumb-exception enable, bit 30)
@@ -392,7 +396,9 @@ impl ArmDebugSequence for RZA1L {
         //   MOV LR, R0         → 0xE1A0_E000
         //   MSR SPSR_fsxc, R0  → 0xE16F_F000  (all four mask bits = fsxc)
         {
-            const MSR_FIQ:  u32 = 0xE321_F0D1; // FIQ  mode (10001) + I+A masked
+            // MSR CPSR_c only writes bits[7:0] = {I, F, T, M[4:0]}; the A bit (8) is in the
+            // `x` field and is not affected here. 0xD1 = I=1, F=1, T=0, mode=FIQ(10001).
+            const MSR_FIQ:  u32 = 0xE321_F0D1; // FIQ  mode (10001), I+F set
             const MSR_IRQ:  u32 = 0xE321_F0D2; // IRQ  mode (10010)
             const MSR_SVC:  u32 = 0xE321_F0D3; // SVC  mode (10011)
             const MSR_ABT:  u32 = 0xE321_F0D7; // ABT  mode (10111)

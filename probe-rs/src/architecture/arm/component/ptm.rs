@@ -52,7 +52,9 @@ const ETM_DEFAULT_EVENT_VALUE: u32 = ETM_HARD_WIRED_RESOURCE_A | ETM_EVENT_NOT_A
 const ETMTSSCR_DISABLED: u32 = 0;
 const ETMTECR2_DISABLED: u32 = 0;
 const ETMTECR1_INCLUDE_EXCEPTIONS: u32 = 1 << 24;
-const ETMCR_ENABLE: u32 = 1 << 11;
+// Note: there is no "trace enable" bit in ETMCR. Per the PTM-A9 TRM (DDI0401C, Table 2.3)
+// bit[11] is Reserved/SBZP. Tracing is enabled solely by clearing ETMCR.ProgBit (bit 10)
+// via `exit_programming_mode()`.
 const ETMCR_TIMESTAMP_ENABLE: u32 = 1 << 28;
 const ETMCR_RETURN_STACK_ENABLE: u32 = 1 << 29;
 const ETMCCER_TIMESTAMP_SUPPORTED: u32 = 1 << 22;
@@ -204,10 +206,9 @@ impl<'a> ProgramTraceMacrocell<'a> {
             features.branch_broadcast = true;
         }
 
-        cr.0 |= ETMCR_ENABLE;
         cr.store(self.component, self.interface)?;
 
-        // Exit programming mode — trace begins
+        // Exit programming mode (clears ProgBit) — this is what starts trace capture.
         self.exit_programming_mode()?;
 
         Ok(features)
